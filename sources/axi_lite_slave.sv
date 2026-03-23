@@ -24,19 +24,8 @@ module axi_lite_slave #(
     output reg                   RVALID,
     input  wire                  RREADY
 );
-    reg [31:0] ctrl_reg;
-    reg [31:0] data_in_reg;
-    reg [31:0] data_out_reg;
-    reg [31:0] status_reg;
-    reg        busy;
-    localparam W_IDLE = 2'd0, W_DATA = 2'd1, W_RESP = 2'd2;
-    reg [1:0] wstate;
-    reg [ADDR_WIDTH-1:0] waddr;
 
-    // TODO: Implement AXI Write FSM
-
-    // TODO: Implement AXI Read FSM
-
-    // TODO: Implement Datapath + Done Logic
+    // TODO: Implement AXI-Lite slave with:
+    
 
 endmodule
