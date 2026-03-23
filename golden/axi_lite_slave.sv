@@ -28,6 +28,8 @@ module axi_lite_slave #(
     reg [31:0] data_in_reg;
     reg [31:0] data_out_reg;
     reg [31:0] status_reg;
+    reg [1:0]  pipe_count;
+    reg        pipe_active;
 
     localparam W_IDLE = 2'd0, W_DATA = 2'd1, W_RESP = 2'd2;
     reg [1:0] wstate;
@@ -87,17 +89,31 @@ module axi_lite_slave #(
         end
     end
 
-    // Datapath - combinational compute, registered output
+    // Datapath with 3-cycle pipeline delay
     always @(posedge ACLK) begin
         if (!ARESETn) begin
             data_out_reg <= 32'd0;
             status_reg   <= 32'd0;
+            pipe_count   <= 2'd0;
+            pipe_active  <= 1'b0;
         end else begin
-            if (ctrl_reg[0]) begin
-                data_out_reg  <= (data_in_reg + 32'd10) << 1;
-                status_reg[0] <= 1'b1;
-            end else begin
+            if (ctrl_reg[0] && !pipe_active && !status_reg[0]) begin
+                pipe_active <= 1'b1;
+                pipe_count  <= 2'd0;
+            end
+
+            if (pipe_active) begin
+                pipe_count <= pipe_count + 1;
+                if (pipe_count == 2'd2) begin
+                    data_out_reg  <= (data_in_reg + 32'd10) << 1;
+                    status_reg[0] <= 1'b1;
+                    pipe_active   <= 1'b0;
+                end
+            end
+
+            if (!ctrl_reg[0]) begin
                 status_reg[0] <= 1'b0;
+                pipe_active   <= 1'b0;
             end
         end
     end
