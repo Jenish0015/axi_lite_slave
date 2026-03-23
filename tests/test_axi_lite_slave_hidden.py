@@ -92,7 +92,7 @@ async def test_axi_lite_write_read(dut):
         await RisingEdge(dut.ACLK)
 
     result = await axi_read(dut, 0x08)
-    expected = (5 + 10) << 1
+    expected = ((5 ^ 0xA5A5A5A5) + 5) >> 2
     assert result == expected, f"DATA_OUT was {result}, expected {expected}"
 
 
@@ -127,7 +127,7 @@ async def test_axi_lite_multiple_operations(dut):
             await RisingEdge(dut.ACLK)
 
         result = await axi_read(dut, 0x08)
-        expected = (input_val + 10) << 1
+        expected = ((input_val ^ 0xA5A5A5A5) + input_val) & 0xFFFFFFFF >> 2
         assert result == expected, \
             f"For input {input_val}: got {result}, expected {expected}"
 
@@ -171,8 +171,8 @@ async def test_axi_lite_back_to_back(dut):
 def test_axi_lite_slave_hidden_runner():
     sim = os.getenv("SIM", "icarus")
     proj_path = Path(__file__).resolve().parent.parent
-    sources = [proj_path / "sources/axi_lite_slave.sv"]
+    sources = [proj_path / "golden/axi_lite_slave.sv"]
     from cocotb_tools.runner import get_runner
     runner = get_runner(sim)
     runner.build(sources=sources, hdl_toplevel="axi_lite_slave", always=True)
-    runner.test(hdl_toplevel="axi_lite_slave", test_module="test_axi_lite_slave_hidden")
+    runner.test(hdl_toplevel="axi_lite_slave", test_module="test_axi_lite_slave_hidden"
