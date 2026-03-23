@@ -89,33 +89,21 @@ module axi_lite_slave #(
         end
     end
 
-    // Datapath with 3-cycle pipeline delay
+    // Datapath
     always @(posedge ACLK) begin
         if (!ARESETn) begin
             data_out_reg <= 32'd0;
             status_reg   <= 32'd0;
-            pipe_count   <= 2'd0;
-            pipe_active  <= 1'b0;
         end else begin
-            if (ctrl_reg[0] && !pipe_active && !status_reg[0]) begin
-                pipe_active <= 1'b1;
-                pipe_count  <= 2'd0;
-            end
-
-            if (pipe_active) begin
-                pipe_count <= pipe_count + 1;
-                if (pipe_count == 2'd2) begin
-                    data_out_reg  <= (data_in_reg + 32'd10) << 1;
-                    status_reg[0] <= 1'b1;
-                    pipe_active   <= 1'b0;
-                end
-            end
-
-            if (!ctrl_reg[0]) begin
+            if (ctrl_reg[0]) begin
+                data_out_reg  <= ((data_in_reg ^ 32'hA5A5A5A5) + data_in_reg) >> 2;
+                status_reg[0] <= 1'b1;
+            end else begin
                 status_reg[0] <= 1'b0;
-                pipe_active   <= 1'b0;
             end
         end
     end
 
 endmodule
+
+
