@@ -131,6 +131,42 @@ async def test_axi_lite_multiple_operations(dut):
         assert result == expected, \
             f"For input {input_val}: got {result}, expected {expected}"
 
+@cocotb.test()
+async def test_axi_lite_back_to_back(dut):
+    """Test back to back operations with ctrl clear between"""
+    clock = Clock(dut.ACLK, 10, units="ns")
+    clock.start(start_high=False)
+    await reset_dut(dut)
+
+    # First operation
+    await axi_write(dut, 0x04, 7)
+    await axi_write(dut, 0x00, 1)
+    for _ in range(50):
+        await RisingEdge(dut.ACLK)
+    result1 = await axi_read(dut, 0x08)
+    expected1 = (7 + 10) << 1
+    assert result1 == expected1, f"First op: got {result1}, expected {expected1}"
+
+    # Clear ctrl
+    await axi_write(dut, 0x00, 0)
+    for _ in range(5):
+        await RisingEdge(dut.ACLK)
+
+    # Second operation with different value
+    await axi_write(dut, 0x04, 20)
+    await axi_write(dut, 0x00, 1)
+    for _ in range(50):
+        await RisingEdge(dut.ACLK)
+    result2 = await axi_read(dut, 0x08)
+    expected2 = (20 + 10) << 1
+    assert result2 == expected2, f"Second op: got {result2}, expected {expected2}"
+
+    # Verify status clears when ctrl=0
+    await axi_write(dut, 0x00, 0)
+    for _ in range(5):
+        await RisingEdge(dut.ACLK)
+    status = await axi_read(dut, 0x0C)
+    assert status == 0, f"Status should be 0 after ctrl clear, got {status}"
 
 def test_axi_lite_slave_hidden_runner():
     sim = os.getenv("SIM", "icarus")
