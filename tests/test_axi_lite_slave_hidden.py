@@ -175,4 +175,4 @@ def test_axi_lite_slave_hidden_runner():
     from cocotb_tools.runner import get_runner
     runner = get_runner(sim)
     runner.build(sources=sources, hdl_toplevel="axi_lite_slave", always=True)
-    runner.test(hdl_toplevel="axi_lite_slave", test_module="test_axi_lite_slave_hidden"
+    runner.test(hdl_toplevel="axi_lite_slave", test_module="test_axi_lite_slave_hidden")
