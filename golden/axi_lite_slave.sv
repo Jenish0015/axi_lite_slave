@@ -1,3 +1,5 @@
+
+
 `timescale 1ns / 1ps
 
 module axi_lite_slave #(
@@ -28,14 +30,12 @@ module axi_lite_slave #(
     reg [31:0] data_in_reg;
     reg [31:0] data_out_reg;
     reg [31:0] status_reg;
-    reg [1:0]  pipe_count;
-    reg        pipe_active;
-
+    reg        busy;
+    reg        ctrl_prev;
     localparam W_IDLE = 2'd0, W_DATA = 2'd1, W_RESP = 2'd2;
     reg [1:0] wstate;
     reg [ADDR_WIDTH-1:0] waddr;
 
-    // AXI Write FSM
     always @(posedge ACLK) begin
         if (!ARESETn) begin
             wstate <= W_IDLE; AWREADY <= 1'b0; WREADY <= 1'b0;
@@ -68,7 +68,6 @@ module axi_lite_slave #(
         end
     end
 
-    // AXI Read FSM
     always @(posedge ACLK) begin
         if (!ARESETn) begin
             ARREADY <= 1'b0; RVALID <= 1'b0; RRESP <= 2'b00; RDATA <= 32'd0;
@@ -89,21 +88,22 @@ module axi_lite_slave #(
         end
     end
 
-    // Datapath
     always @(posedge ACLK) begin
         if (!ARESETn) begin
             data_out_reg <= 32'd0;
             status_reg   <= 32'd0;
+            busy         <= 1'b0;
+            ctrl_prev    <= 1'b0;
         end else begin
-            if (ctrl_reg[0]) begin
-                data_out_reg  <= ((data_in_reg ^ 32'hA5A5A5A5) + data_in_reg) >> 2;
+            ctrl_prev <= ctrl_reg[0];
+            if (ctrl_reg[0] && !ctrl_prev && !busy) begin
+                busy          <= 1'b1;
+                data_out_reg  <= (data_in_reg + 32'd10) << 1;
                 status_reg[0] <= 1'b1;
-            end else begin
-                status_reg[0] <= 1'b0;
             end
+            if (busy) busy <= 1'b0;
+            if (!ctrl_reg[0]) status_reg[0] <= 1'b0;
         end
     end
 
 endmodule
-
-

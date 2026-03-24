@@ -1,6 +1,1 @@
 Complete the implementation of the AXI-Lite slave module in sources/axi_lite_slave.sv.
-The module must implement:
-1. AXI-Lite Write FSM with states: W_IDLE, W_DATA, W_RESP
-- Register map: 0x00=ctrl_reg, 0x04=data_in_reg
-2. AXI-Lite Read FSM
-- Register map: 0x00=ctrl_reg, 0x04=data_in_reg, 0x08=data_out_reg, 0x0C=status_reg
