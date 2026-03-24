@@ -1,13 +1,30 @@
 Complete the implementation of the AXI-Lite slave module in sources/axi_lite_slave.sv.
 
-The module has 4 registers:
-- 0x00: CTRL (R/W) - bit[0] = start trigger
-- 0x04: DATA_IN (R/W) - input value
-- 0x08: DATA_OUT (RO) - computed result
-- 0x0C: STATUS (RO) - bit[0] = done flag
+## Register Map
+| Address | Name     | Access | Description              |
+|---------|----------|--------|--------------------------|
+| 0x00    | ctrl_reg | R/W    | bit[0] = start trigger   |
+| 0x04    | data_in  | R/W    | input data register      |
+| 0x08    | data_out | RO     | computed result          |
+| 0x0C    | status   | RO     | bit[0] = done flag       |
 
-When CTRL bit[0] goes from 0 to 1 (rising edge), compute and store in DATA_OUT:
-  DATA_OUT = (((DATA_IN ^ 32'hA5A5A5A5) + DATA_IN) & 32'hFFFFFFFF) >> 2
+## AXI-Lite Write FSM
+Use three states: W_IDLE, W_DATA, W_RESP
+- W_IDLE: assert AWREADY=1, wait for AWVALID, capture address, move to W_DATA
+- W_DATA: assert WREADY=1, wait for WVALID, write to register, assert BVALID, move to W_RESP
+- W_RESP: wait for BREADY, deassert BVALID, return to W_IDLE
 
-After reset (ARESETn=0), all registers must be 0.
-STATUS becomes 1 after computation completes, and clears back to 0 when CTRL bit[0] is written to 0.
+## AXI-Lite Read FSM
+- When ARVALID=1: capture address, assert ARREADY=1 and RVALID=1, set RDATA from register map
+- When RREADY=1: deassert RVALID=1 and ARREADY
+
+## Datapath
+- On rising edge: when ctrl_reg[0]=1, compute:
+  data_out_reg = (((data_in_reg ^ 32'hA5A5A5A5) + data_in_reg) & 32'hFFFFFFFF) >> 2
+- Set status_reg[0]=1 immediately after computation
+- Clear status_reg[0]=0 when ctrl_reg[0] is written to 0
+
+## Reset Behavior (ARESETn=0)
+- All registers must be 0
+- FSM returns to W_IDLE
+- AWREADY=0, WREADY=0, BVALID=0, ARREADY=0, RVALID=0
