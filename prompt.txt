@@ -1,30 +1,26 @@
-Complete the implementation of the AXI-Lite slave module in sources/axi_lite_slave.sv.
+Complete the AXI-Lite slave in `sources/axi_lite_slave.sv`. Do not change ports.
 
-## Register Map
-| Address | Name     | Access | Description              |
-|---------|----------|--------|--------------------------|
-| 0x00    | ctrl_reg | R/W    | bit[0] = start trigger   |
-| 0x04    | data_in  | R/W    | input data register      |
-| 0x08    | data_out | RO     | computed result          |
-| 0x0C    | status   | RO     | bit[0] = done flag       |
+1) Write path (AW/W -> B)
+   - Produce valid BRESP/BVALID. Only update mapped registers after the write transaction is accepted (complete AW+W handling per your FSM).
+   - Writes:
+     - 0x00 -> ctrl_reg
+     - 0x04 -> data_in_reg
 
-## AXI-Lite Write FSM
-Use three states: W_IDLE, W_DATA, W_RESP
-- W_IDLE: assert AWREADY=1, wait for AWVALID, capture address, move to W_DATA
-- W_DATA: assert WREADY=1, wait for WVALID, write to register, assert BVALID, move to W_RESP
-- W_RESP: wait for BREADY, deassert BVALID, return to W_IDLE
+2) Read path (AR -> R)
+   - Drive RDATA from the addressed register for aligned word addresses:
+     - 0x00 ctrl_reg, 0x04 data_in_reg, 0x08 data_out_reg, 0x0C status_reg
 
-## AXI-Lite Read FSM
-- When ARVALID=1: capture address, assert ARREADY=1 and RVALID=1, set RDATA from register map
-- When RREADY=1: deassert RVALID=1 and ARREADY
+3) Datapath + status
+   - When ctrl_reg[0]==1: compute data_out_reg = (data_in_reg + 10) << 1, then set status_reg[0]=1 when that result is valid for reads.
+   - When ctrl_reg[0]==0: clear status_reg[0] (and do not leave stale status from prior operations).
+   - After asynchronous reset: all control/datapath registers must be in known, consistent values (especially status_reg and data_out_reg as required for reads).
 
-## Datapath
-- On rising edge: when ctrl_reg[0]=1, compute:
-  data_out_reg = (((data_in_reg ^ 32'hA5A5A5A5) + data_in_reg) & 32'hFFFFFFFF) >> 2
-- Set status_reg[0]=1 immediately after computation
-- Clear status_reg[0]=0 when ctrl_reg[0] is written to 0
+4) Sequencing
+   - Support back-to-back writes/reads without losing register state or protocol correctness.
 
-## Reset Behavior (ARESETn=0)
-- All registers must be 0
-- FSM returns to W_IDLE
-- AWREADY=0, WREADY=0, BVALID=0, ARREADY=0, RVALID=0
+5) Self-check before finishing
+   - Reset then read status; ctrl/data path; toggle ctrl[0]; verify data_out and status timing match the rules above.
+
+## Hints (optional)
+- Commit register writes only after the AXI-Lite write beat is fully accepted (AW/W handshakes complete for your design).
+- If tests fail on reset or status: default all user-visible regs after reset; clear status_reg[0] when ctrl_reg[0] is low; align RDATA mux with stored registers.
