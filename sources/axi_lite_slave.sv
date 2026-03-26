@@ -25,193 +25,165 @@ module axi_lite_slave #(
     input  wire                   RREADY
 );
 
-    localparam [ADDR_WIDTH-1:0] ADDR_CTRL       = 6'h00;
-    localparam [ADDR_WIDTH-1:0] ADDR_DATA_IN    = 6'h04;
-    localparam [ADDR_WIDTH-1:0] ADDR_DATA_OUT   = 6'h08;
-    localparam [ADDR_WIDTH-1:0] ADDR_STATUS     = 6'h0C;
-    localparam [ADDR_WIDTH-1:0] ADDR_SCRATCH    = 6'h10;
-    localparam [ADDR_WIDTH-1:0] ADDR_IRQ_STATUS = 6'h14;
+    localparam [ADDR_WIDTH-1:0] ADDR_FIFO_PUSH   = 6'h00;
+    localparam [ADDR_WIDTH-1:0] ADDR_FIFO_STATUS = 6'h04;
+    localparam [ADDR_WIDTH-1:0] ADDR_FIFO_POP    = 6'h08;
+    localparam [ADDR_WIDTH-1:0] ADDR_FIFO_SUM    = 6'h0C;
 
-    localparam [1:0] W_IDLE = 2'd0, W_DATA = 2'd1, W_RESP = 2'd2;
-    localparam [1:0] R_IDLE = 2'd0, R_DATA = 2'd1;
+    reg [31:0] fifo_mem [0:7];
+    reg [2:0]  rd_ptr;
+    reg [2:0]  wr_ptr;
+    reg [3:0]  count;
 
-    reg [31:0] ctrl_reg;
-    reg [31:0] data_in_reg;
-    reg [31:0] data_out_reg;
-    reg [31:0] status_reg;
-    reg [31:0] scratch_reg;
-    reg [31:0] irq_status_reg;
+    reg                    aw_latched;
+    reg                    w_latched;
+    reg [ADDR_WIDTH-1:0]   aw_addr_reg;
+    reg [DATA_WIDTH-1:0]   w_data_reg;
+    reg [3:0]              w_strb_reg;
 
-    reg [1:0]            wstate;
-    reg [ADDR_WIDTH-1:0] waddr;
-    reg [1:0]            rstate;
-    reg [ADDR_WIDTH-1:0] raddr;
+    reg                    pop_pending;
 
-    reg        busy;
-    reg [1:0]  comp_wait;
-    reg        pending_acc_en;
-    reg        pending_irq_en;
-    reg [31:0] pending_result;
+    wire fifo_full  = (count == 4'd8);
+    wire fifo_empty = (count == 4'd0);
 
-    wire w_done = (wstate == W_DATA) && WVALID && WREADY;
-    wire [32:0] sum33 = {1'b0, data_in_reg ^ 32'hA5A5A5A5} + {1'b0, data_in_reg};
-    wire [31:0] compute_result = sum33[32:2];
+    integer i;
+    reg [31:0] fifo_sum_comb;
+    reg [31:0] push_data;
+    reg do_push, do_pop;
 
-    // Write channel FSM
-    always @(posedge ACLK or negedge ARESETn) begin
-        if (!ARESETn) begin
-            wstate  <= W_IDLE;
-            AWREADY <= 1'b1;
-            WREADY  <= 1'b0;
-            BVALID  <= 1'b0;
-            BRESP   <= 2'b00;
-            waddr   <= {ADDR_WIDTH{1'b0}};
-        end else begin
-            case (wstate)
-                W_IDLE: begin
-                    BVALID <= 1'b0;
-                    if (AWVALID && AWREADY) begin
-                        waddr   <= AWADDR;
-                        AWREADY <= 1'b0;
-                        WREADY  <= 1'b1;
-                        wstate  <= W_DATA;
-                    end
-                end
-                W_DATA: begin
-                    if (WVALID && WREADY) begin
-                        WREADY <= 1'b0;
-                        case (waddr)
-                            ADDR_CTRL, ADDR_DATA_IN, ADDR_DATA_OUT, ADDR_STATUS, ADDR_SCRATCH, ADDR_IRQ_STATUS:
-                                BRESP <= 2'b00;
-                            default:
-                                BRESP <= 2'b10;
-                        endcase
-                        BVALID <= 1'b1;
-                        wstate <= W_RESP;
-                    end
-                end
-                W_RESP: begin
-                    if (BVALID && BREADY) begin
-                        BVALID  <= 1'b0;
-                        AWREADY <= 1'b1;
-                        wstate  <= W_IDLE;
-                    end
-                end
-                default: wstate <= W_IDLE;
-            endcase
-        end
+    always @(*) begin
+        fifo_sum_comb = 32'd0;
+        for (i = 0; i < count; i = i + 1)
+            fifo_sum_comb = fifo_sum_comb + fifo_mem[(rd_ptr + i) & 3'h7];
+
+        push_data[7:0]   = w_strb_reg[0] ? w_data_reg[7:0]   : 8'h00;
+        push_data[15:8]  = w_strb_reg[1] ? w_data_reg[15:8]  : 8'h00;
+        push_data[23:16] = w_strb_reg[2] ? w_data_reg[23:16] : 8'h00;
+        push_data[31:24] = w_strb_reg[3] ? w_data_reg[31:24] : 8'h00;
     end
 
-    // Read channel FSM
     always @(posedge ACLK or negedge ARESETn) begin
         if (!ARESETn) begin
-            rstate   <= R_IDLE;
-            ARREADY  <= 1'b1;
-            RVALID   <= 1'b0;
-            RDATA    <= 32'b0;
-            RRESP    <= 2'b00;
-            raddr    <= {ADDR_WIDTH{1'b0}};
-        end else begin
-            case (rstate)
-                R_IDLE: begin
-                    RVALID <= 1'b0;
-                    if (ARVALID && ARREADY) begin
-                        ARREADY <= 1'b0;
-                        raddr   <= ARADDR;
-                        case (ARADDR)
-                            ADDR_CTRL:       begin RDATA <= ctrl_reg;       RRESP <= 2'b00; end
-                            ADDR_DATA_IN:    begin RDATA <= data_in_reg;    RRESP <= 2'b00; end
-                            ADDR_DATA_OUT:   begin RDATA <= data_out_reg;   RRESP <= 2'b00; end
-                            ADDR_STATUS:     begin RDATA <= status_reg;     RRESP <= 2'b00; end
-                            ADDR_SCRATCH:    begin RDATA <= scratch_reg;    RRESP <= 2'b00; end
-                            ADDR_IRQ_STATUS: begin RDATA <= irq_status_reg; RRESP <= 2'b00; end
-                            default:         begin RDATA <= 32'b0;          RRESP <= 2'b10; end
-                        endcase
-                        RVALID <= 1'b1;
-                        rstate <= R_DATA;
-                    end
-                end
-                R_DATA: begin
-                    if (RREADY && RVALID) begin
-                        RVALID  <= 1'b0;
-                        ARREADY <= 1'b1;
-                        rstate  <= R_IDLE;
-                    end
-                end
-                default: rstate <= R_IDLE;
-            endcase
-        end
-    end
+            AWREADY    <= 1'b0;
+            WREADY     <= 1'b0;
+            BVALID     <= 1'b0;
+            BRESP      <= 2'b00;
+            ARREADY    <= 1'b0;
+            RVALID     <= 1'b0;
+            RDATA      <= 32'b0;
+            RRESP      <= 2'b00;
 
-    // Registers and datapath
-    always @(posedge ACLK or negedge ARESETn) begin
-        if (!ARESETn) begin
-            ctrl_reg       <= 32'b0;
-            data_in_reg    <= 32'b0;
-            data_out_reg   <= 32'b0;
-            status_reg     <= 32'b0;
-            scratch_reg    <= 32'b0;
-            irq_status_reg <= 32'b0;
-            busy           <= 1'b0;
-            comp_wait      <= 2'd0;
-            pending_acc_en <= 1'b0;
-            pending_irq_en <= 1'b0;
-            pending_result <= 32'b0;
+            aw_latched <= 1'b0;
+            w_latched  <= 1'b0;
+            aw_addr_reg <= {ADDR_WIDTH{1'b0}};
+            w_data_reg  <= {DATA_WIDTH{1'b0}};
+            w_strb_reg  <= 4'b0;
+            pop_pending <= 1'b0;
+
+            rd_ptr <= 3'd0;
+            wr_ptr <= 3'd0;
+            count  <= 4'd0;
+            for (i = 0; i < 8; i = i + 1)
+                fifo_mem[i] <= 32'd0;
         end else begin
-            // Bus writes
-            if (w_done) begin
-                case (waddr)
-                    ADDR_CTRL: begin
-                        if (WSTRB[0]) ctrl_reg[2:0] <= WDATA[2:0];
-                        status_reg[0] <= 1'b0;
+            do_push = 1'b0;
+            do_pop  = 1'b0;
+
+            AWREADY <= (!aw_latched) && (!BVALID);
+            WREADY  <= (!w_latched)  && (!BVALID);
+            ARREADY <= (!RVALID);
+
+            if (!aw_latched && !BVALID && AWVALID) begin
+                aw_latched  <= 1'b1;
+                aw_addr_reg <= AWADDR;
+            end
+
+            if (!w_latched && !BVALID && WVALID) begin
+                w_latched <= 1'b1;
+                w_data_reg <= WDATA;
+                w_strb_reg <= WSTRB;
+            end
+
+            if (aw_latched && w_latched && !BVALID) begin
+                case (aw_addr_reg)
+                    ADDR_FIFO_PUSH: begin
+                        if (!fifo_full) begin
+                            do_push = 1'b1;
+                            BRESP   <= 2'b00;
+                        end else begin
+                            BRESP   <= 2'b10;
+                        end
                     end
-                    ADDR_DATA_IN: begin
-                        if (WSTRB[0]) data_in_reg[7:0]   <= WDATA[7:0];
-                        if (WSTRB[1]) data_in_reg[15:8]  <= WDATA[15:8];
-                        if (WSTRB[2]) data_in_reg[23:16] <= WDATA[23:16];
-                        if (WSTRB[3]) data_in_reg[31:24] <= WDATA[31:24];
+                    ADDR_FIFO_STATUS,
+                    ADDR_FIFO_POP,
+                    ADDR_FIFO_SUM: BRESP <= 2'b00;
+                    default:       BRESP <= 2'b10;
+                endcase
+                BVALID     <= 1'b1;
+                aw_latched <= 1'b0;
+                w_latched  <= 1'b0;
+            end
+
+            if (BVALID && BREADY)
+                BVALID <= 1'b0;
+
+            if (!RVALID && ARVALID) begin
+                case (ARADDR)
+                    ADDR_FIFO_PUSH: begin
+                        RDATA <= 32'd0;
+                        RRESP <= 2'b00;
+                        pop_pending <= 1'b0;
                     end
-                    ADDR_SCRATCH: begin
-                        if (WSTRB[0]) scratch_reg[7:0]   <= WDATA[7:0];
-                        if (WSTRB[1]) scratch_reg[15:8]  <= WDATA[15:8];
-                        if (WSTRB[2]) scratch_reg[23:16] <= WDATA[23:16];
-                        if (WSTRB[3]) scratch_reg[31:24] <= WDATA[31:24];
+                    ADDR_FIFO_STATUS: begin
+                        RDATA <= {26'd0, fifo_empty, fifo_full, count};
+                        RRESP <= 2'b00;
+                        pop_pending <= 1'b0;
+                    end
+                    ADDR_FIFO_POP: begin
+                        if (!fifo_empty) begin
+                            RDATA <= fifo_mem[rd_ptr];
+                            RRESP <= 2'b00;
+                            pop_pending <= 1'b1;
+                        end else begin
+                            RDATA <= 32'hDEADBEEF;
+                            RRESP <= 2'b10;
+                            pop_pending <= 1'b0;
+                        end
+                    end
+                    ADDR_FIFO_SUM: begin
+                        RDATA <= fifo_sum_comb;
+                        RRESP <= 2'b00;
+                        pop_pending <= 1'b0;
                     end
                     default: begin
-                        // RO and unmapped: no register mutation
+                        RDATA <= 32'd0;
+                        RRESP <= 2'b10;
+                        pop_pending <= 1'b0;
                     end
                 endcase
+                RVALID <= 1'b1;
             end
 
-            // Launch operation on start pulse when idle
-            if (!busy && ctrl_reg[0]) begin
-                busy           <= 1'b1;
-                comp_wait      <= 2'd2;
-                pending_acc_en <= ctrl_reg[1];
-                pending_irq_en <= ctrl_reg[2];
-                pending_result <= compute_result;
-                ctrl_reg[0]    <= 1'b0; // self-clear START
-                status_reg[0]  <= 1'b0;
-            end else if (busy && (comp_wait != 2'd0)) begin
-                comp_wait <= comp_wait - 2'd1;
-            end else if (busy && (comp_wait == 2'd0)) begin
-                busy <= 1'b0;
-                if (pending_acc_en)
-                    data_out_reg <= data_out_reg + pending_result;
-                else
-                    data_out_reg <= pending_result;
-                status_reg[0] <= 1'b1;
-                if (pending_irq_en)
-                    irq_status_reg[0] <= 1'b1;
+            if (RVALID && RREADY) begin
+                if (pop_pending) begin
+                    do_pop = 1'b1;
+                    pop_pending <= 1'b0;
+                end
+                RVALID <= 1'b0;
             end
 
-            // Read-to-clear semantics
-            if ((rstate == R_DATA) && RVALID && RREADY && (RRESP == 2'b00)) begin
-                if ((raddr == ADDR_STATUS) && RDATA[0])
-                    status_reg[0] <= 1'b0;
-                if ((raddr == ADDR_IRQ_STATUS) && RDATA[0])
-                    irq_status_reg[0] <= 1'b0;
+            if (do_push) begin
+                fifo_mem[wr_ptr] <= push_data;
+                wr_ptr <= wr_ptr + 3'd1;
             end
+            if (do_pop)
+                rd_ptr <= rd_ptr + 3'd1;
+
+            case ({do_push, do_pop})
+                2'b10: count <= count + 4'd1;
+                2'b01: count <= count - 4'd1;
+                default: count <= count;
+            endcase
         end
     end
 

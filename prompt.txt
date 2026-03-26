@@ -1,3 +1,33 @@
-Implement the AXI-Lite slave module in sources/axi_lite_slave.sv from scratch.
-The module ports are already defined. You must fill in the complete RTL implementation.
+Implement an AXI4-Lite Slave module containing an 8-deep 32-bit FIFO and some computation logic.
+The module must exactly match the ports defined in `sources/axi_lite_slave.sv`.
 
+Register Map:
+0x00 (FIFO_PUSH) : Write-Only. Pushes WDATA into the FIFO.
+                   - Applies WSTRB. Any byte where WSTRB is 0 must be written as 0x00.
+                   - If the FIFO is full, the write is ignored and the response (BRESP) must be SLVERR (2'b10).
+                   - Reads return 0 and OKAY.
+0x04 (FIFO_STATUS) : Read-Only.
+                   - Bits [3:0]: Number of valid entries in the FIFO (0 to 8).
+                   - Bit [4]: FIFO Full flag.
+                   - Bit [5]: FIFO Empty flag.
+                   - Writes are ignored and return OKAY.
+0x08 (FIFO_POP) : Read-Only.
+                  - Reads pop the oldest entry from the FIFO and return it.
+                  - The pop must happen exactly once per read transaction.
+                  - If the FIFO is empty, returns 0xDEADBEEF and the response (RRESP) must be SLVERR (2'b10).
+                  - Writes are ignored and return OKAY.
+0x0C (FIFO_SUM) : Read-Only.
+                  - Returns the 32-bit sum of all currently valid entries in the FIFO.
+                  - If empty, returns 0.
+                  - Writes are ignored and return OKAY.
+
+AXI4-Lite Protocol Strict Requirements:
+1. AW and W channels must be decoupled. AWVALID can precede WVALID, WVALID can precede AWVALID, or they can assert in the same cycle. Your design must NOT assume AWVALID comes first.
+2. AWREADY and WREADY must be asserted independently based on the slave's readiness to accept address and data.
+3. BVALID must only be asserted after BOTH AW and W handshakes have successfully completed.
+4. RVALID must only be asserted after the AR handshake completes. It must remain asserted with stable RDATA until RREADY is received.
+5. Popping the FIFO on a read to 0x08 must be handled carefully to ensure exactly one element is popped per AXI4-Lite read transaction, even if RREADY is delayed or stalls.
+6. Pushing to the FIFO on a write to 0x00 must ensure exactly one element is pushed per AXI4-Lite write transaction.
+7. Any access (read or write) to an unmapped address (i.e., not 0x00, 0x04, 0x08, 0x0C) must return SLVERR.
+
+You should implement the complete RTL module inside `sources/axi_lite_slave.sv`.
