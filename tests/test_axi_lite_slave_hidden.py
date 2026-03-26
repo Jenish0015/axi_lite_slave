@@ -1,352 +1,191 @@
-from __future__ import annotations
+@cocotb.test()
+async def test_axi_lite_torture_hard_fail_most_rtl(dut):
+    """
+    Hard combined stress:
+    - strict AW/W/B sequencing and backpressure
+    - strict AR/R backpressure and data hold
+    - WSTRB masking on CTRL and DATA_IN
+    - retrigger semantics with CTRL edge-only launch
+    - fixed pipeline latency (32 cycles) with no early DATA_OUT update
+    - reset mid-flight cancels pending result
+    """
+    from cocotb.clock import Clock
+    from cocotb.triggers import RisingEdge
 
-import os
-from pathlib import Path
+    PIPE_CYC = 32
 
-import cocotb
-from cocotb.clock import Clock
-from cocotb.triggers import RisingEdge
-from cocotb_tools.runner import get_runner
+    def exp(v):
+        return (((v ^ 0xA5A5A5A5) + v) & 0xFFFFFFFF) >> 2
 
-# ---------------------------------------------------------------------------
-# Register map
-# ---------------------------------------------------------------------------
-ADDR_CTRL       = 0x00
-ADDR_DATA_IN    = 0x04
-ADDR_DATA_OUT   = 0x08
-ADDR_STATUS     = 0x0C
-ADDR_SCRATCH    = 0x10
-ADDR_IRQ_STATUS = 0x14
+    async def wait(n):
+        for _ in range(n):
+            await RisingEdge(dut.ACLK)
 
-RESP_OKAY   = 0b00
-RESP_SLVERR = 0b10
+    async def reset():
+        dut.ARESETn.value = 0
+        dut.AWVALID.value = 0
+        dut.WVALID.value = 0
+        dut.BREADY.value = 0
+        dut.ARVALID.value = 0
+        dut.RREADY.value = 0
+        dut.AWADDR.value = 0
+        dut.WDATA.value = 0
+        dut.WSTRB.value = 0xF
+        dut.ARADDR.value = 0
+        await wait(5)
+        dut.ARESETn.value = 1
+        await wait(3)
 
-CTRL_START  = (1 << 0)
-CTRL_ACC_EN = (1 << 1)
-CTRL_IRQ_EN = (1 << 2)
-
-
-# ---------------------------------------------------------------------------
-# AXI-Lite helpers
-# ---------------------------------------------------------------------------
-
-async def axi_write(dut, addr, data, strb=0xF):
-    await RisingEdge(dut.ACLK)
-    dut.AWADDR.value  = addr
-    dut.AWVALID.value = 1
-    dut.WDATA.value   = data
-    dut.WSTRB.value   = strb
-    dut.WVALID.value  = 1
-
-    while True:
+    async def wr(addr, data, wstrb=0xF):
+        dut.AWADDR.value = addr
+        dut.AWVALID.value = 1
+        for _ in range(50):
+            await RisingEdge(dut.ACLK)
+            if dut.AWREADY.value == 1:
+                break
+        dut.AWVALID.value = 0
         await RisingEdge(dut.ACLK)
-        if dut.AWREADY.value == 1:
-            break
-    dut.AWVALID.value = 0
 
-    while True:
-        if dut.WREADY.value == 1:
-            break
+        dut.WDATA.value = data
+        dut.WSTRB.value = wstrb
+        dut.WVALID.value = 1
+        for _ in range(50):
+            await RisingEdge(dut.ACLK)
+            if dut.WREADY.value == 1:
+                break
+        dut.WVALID.value = 0
         await RisingEdge(dut.ACLK)
-    dut.WVALID.value = 0
 
-    dut.BREADY.value = 1
-    while True:
+        dut.BREADY.value = 1
+        for _ in range(50):
+            await RisingEdge(dut.ACLK)
+            if dut.BVALID.value == 1:
+                break
+        bresp = dut.BRESP.value.integer
+        dut.BREADY.value = 0
         await RisingEdge(dut.ACLK)
-        if dut.BVALID.value == 1:
-            break
-    bresp = int(dut.BRESP.value)
-    await RisingEdge(dut.ACLK)
-    dut.BREADY.value = 0
-    return bresp
+        return bresp
 
+    async def rd(addr):
+        dut.ARADDR.value = addr
+        dut.ARVALID.value = 1
+        dut.RREADY.value = 1
+        for _ in range(50):
+            await RisingEdge(dut.ACLK)
+            if dut.ARREADY.value == 1:
+                break
+        dut.ARVALID.value = 0
+        for _ in range(50):
+            if dut.RVALID.value == 1:
+                d = dut.RDATA.value.integer
+                r = dut.RRESP.value.integer
+                dut.RREADY.value = 0
+                await RisingEdge(dut.ACLK)
+                return d, r
+            await RisingEdge(dut.ACLK)
+        dut.RREADY.value = 0
+        await RisingEdge(dut.ACLK)
+        return 0, 0
 
-async def axi_read(dut, addr):
-    await RisingEdge(dut.ACLK)
-    dut.ARADDR.value  = addr
+    clock = Clock(dut.ACLK, 10, units="ns")
+    clock.start(start_high=False)
+    await reset()
+
+    # 1) CTRL write masked off: must not trigger
+    await wr(0x04, 0x11223344, 0xF)
+    await wr(0x00, 0x00000001, 0x0)  # masked bit0
+    await wait(20)
+    st, _ = await rd(0x0C)
+    out, _ = await rd(0x08)
+    assert st == 0 and out == 0, f"Masked CTRL wrongly triggered: STATUS={st}, DATA_OUT={out}"
+
+    # 2) Trigger run #1
+    await wr(0x00, 0x1, 0x1)
+
+    # 3) Mid-pipeline DATA_OUT must remain old value
+    await wait(PIPE_CYC // 3)
+    early, _ = await rd(0x08)
+    assert early == 0, f"DATA_OUT updated too early: {early}"
+
+    # 4) Retrigger before completion: clear ctrl, new DATA_IN, set ctrl again
+    await wr(0x00, 0x0, 0x1)
+    await wr(0x04, 0x0000002A, 0xF)
+    await wr(0x00, 0x1, 0x1)
+
+    # 5) Read-channel hold check (RREADY low)
+    dut.RREADY.value = 0
+    dut.ARADDR.value = 0x08
     dut.ARVALID.value = 1
-
-    while True:
+    for _ in range(50):
         await RisingEdge(dut.ACLK)
         if dut.ARREADY.value == 1:
             break
     dut.ARVALID.value = 0
-
-    dut.RREADY.value = 1
-    while True:
+    for _ in range(50):
+        await RisingEdge(dut.ACLK)
         if dut.RVALID.value == 1:
             break
-        await RisingEdge(dut.ACLK)
-    rdata = int(dut.RDATA.value)
-    rresp = int(dut.RRESP.value)
-    await RisingEdge(dut.ACLK)
-    dut.RREADY.value = 0
-    return rdata, rresp
-
-
-async def reset_dut(dut, cycles=6):
-    dut.ARESETn.value = 0
-    dut.AWADDR.value  = 0;  dut.AWVALID.value = 0
-    dut.WDATA.value   = 0;  dut.WSTRB.value   = 0xF; dut.WVALID.value = 0
-    dut.BREADY.value  = 0
-    dut.ARADDR.value  = 0;  dut.ARVALID.value = 0
-    dut.RREADY.value  = 0
-    for _ in range(cycles):
-        await RisingEdge(dut.ACLK)
-    dut.ARESETn.value = 1
-    await RisingEdge(dut.ACLK)
-    await RisingEdge(dut.ACLK)
-
-
-async def wait_done(dut, timeout=60):
-    """Poll STATUS until done bit set. STATUS[0] is read-to-clear so
-    the first read that sees it high also clears it."""
-    for i in range(timeout):
-        rdata, _ = await axi_read(dut, ADDR_STATUS)
-        if rdata & 1:
-            return i + 1
-    raise AssertionError("STATUS.done never set within timeout")
-
-
-def compute_result(val: int) -> int:
-    xor_val = val ^ 0xA5A5A5A5
-    total   = (xor_val + val) & 0x1_FFFF_FFFF
-    return (total >> 2) & 0xFFFF_FFFF
-
-
-# ---------------------------------------------------------------------------
-# Test 1 — Reset defaults and basic register access
-# ---------------------------------------------------------------------------
-@cocotb.test()
-async def test_axi_lite_write_read(dut):
-    """All registers reset to 0; RW regs work; RO regs protected; SLVERR."""
-    clock = Clock(dut.ACLK, 10, unit="ns")
-    clock.start(start_high=False)
-    await reset_dut(dut)
-
-    # All registers must default to 0 after reset
-    for addr, name in [
-        (ADDR_CTRL,       "CTRL"),
-        (ADDR_DATA_IN,    "DATA_IN"),
-        (ADDR_DATA_OUT,   "DATA_OUT"),
-        (ADDR_STATUS,     "STATUS"),
-        (ADDR_SCRATCH,    "SCRATCH"),
-        (ADDR_IRQ_STATUS, "IRQ_STATUS"),
-    ]:
-        rdata, rresp = await axi_read(dut, addr)
-        assert rresp == RESP_OKAY, f"{name}: bad RRESP after reset"
-        assert rdata == 0,         f"{name}: expected 0 after reset, got 0x{rdata:08X}"
-
-    # DATA_IN write/readback
-    await axi_write(dut, ADDR_DATA_IN, 0xDEAD_BEEF)
-    rdata, _ = await axi_read(dut, ADDR_DATA_IN)
-    assert rdata == 0xDEAD_BEEF, f"DATA_IN readback: got 0x{rdata:08X}"
-
-    # SCRATCH write/readback
-    await axi_write(dut, ADDR_SCRATCH, 0x1234_5678)
-    rdata, _ = await axi_read(dut, ADDR_SCRATCH)
-    assert rdata == 0x1234_5678, f"SCRATCH readback: got 0x{rdata:08X}"
-
-    # DATA_OUT, STATUS, IRQ_STATUS are read-only
-    await axi_write(dut, ADDR_DATA_OUT,   0xFFFF_FFFF)
-    await axi_write(dut, ADDR_STATUS,     0xFFFF_FFFF)
-    await axi_write(dut, ADDR_IRQ_STATUS, 0xFFFF_FFFF)
-    rdata, _ = await axi_read(dut, ADDR_DATA_OUT)
-    assert rdata == 0, "DATA_OUT should be read-only"
-
-    # Unmapped address → SLVERR
-    rdata, rresp = await axi_read(dut, 0x3C)
-    assert rresp == RESP_SLVERR, f"Expected SLVERR for unmapped read, got {rresp}"
-    assert rdata == 0,           "Expected RDATA=0 for unmapped read"
-
-    # CTRL upper bits [31:3] are RAZ/WI
-    await axi_write(dut, ADDR_CTRL, 0x0000_00FF)
-    rdata, _ = await axi_read(dut, ADDR_CTRL)
-    assert (rdata & 0xFFFF_FFF8) == 0, \
-        f"CTRL upper bits should be RAZ/WI, got 0x{rdata:08X}"
-
-
-# ---------------------------------------------------------------------------
-# Test 2 — Reset clears all state
-# ---------------------------------------------------------------------------
-@cocotb.test()
-async def test_axi_lite_reset(dut):
-    """Re-applying reset clears all registers including SCRATCH and DATA_OUT."""
-    clock = Clock(dut.ACLK, 10, unit="ns")
-    clock.start(start_high=False)
-    await reset_dut(dut)
-
-    await axi_write(dut, ADDR_DATA_IN, 0xCAFE_F00D)
-    await axi_write(dut, ADDR_SCRATCH, 0xBEEF_CAFE)
-    await axi_write(dut, ADDR_CTRL,    CTRL_START)
+    hdata = dut.RDATA.value.integer
+    hresp = dut.RRESP.value.integer
     for _ in range(8):
         await RisingEdge(dut.ACLK)
+        assert dut.RVALID.value == 1, "RVALID dropped while RREADY=0"
+        assert dut.RDATA.value.integer == hdata, "RDATA changed while held"
+        assert dut.RRESP.value.integer == hresp, "RRESP changed while held"
+    dut.RREADY.value = 1
+    await RisingEdge(dut.ACLK)
+    assert dut.RVALID.value == 0, "RVALID did not clear after handshake"
+    dut.RREADY.value = 0
 
-    # Re-apply reset
-    dut.ARESETn.value = 0
-    for _ in range(5):
+    # 6) Write-response hold check (BREADY low)
+    dut.BREADY.value = 0
+    dut.AWADDR.value = 0x04
+    dut.AWVALID.value = 1
+    for _ in range(50):
         await RisingEdge(dut.ACLK)
-    dut.ARESETn.value = 1
+        if dut.AWREADY.value == 1:
+            break
+    dut.AWVALID.value = 0
     await RisingEdge(dut.ACLK)
+    dut.WDATA.value = 0xDEADBEEF
+    dut.WSTRB.value = 0xF
+    dut.WVALID.value = 1
+    for _ in range(50):
+        await RisingEdge(dut.ACLK)
+        if dut.WREADY.value == 1:
+            break
+    dut.WVALID.value = 0
+    for _ in range(50):
+        await RisingEdge(dut.ACLK)
+        if dut.BVALID.value == 1:
+            break
+    hb = dut.BRESP.value.integer
+    for _ in range(8):
+        await RisingEdge(dut.ACLK)
+        assert dut.BVALID.value == 1, "BVALID dropped while BREADY=0"
+        assert dut.BRESP.value.integer == hb, "BRESP changed while held"
+        assert dut.AWREADY.value == 0, "AWREADY should stay low while write response pending"
+    dut.BREADY.value = 1
     await RisingEdge(dut.ACLK)
+    assert dut.BVALID.value == 0, "BVALID did not clear after handshake"
+    assert dut.AWREADY.value == 1, "AWREADY did not reassert after B handshake"
+    dut.BREADY.value = 0
 
-    for addr, name in [
-        (ADDR_CTRL,       "CTRL"),
-        (ADDR_DATA_IN,    "DATA_IN"),
-        (ADDR_DATA_OUT,   "DATA_OUT"),
-        (ADDR_SCRATCH,    "SCRATCH"),
-        (ADDR_IRQ_STATUS, "IRQ_STATUS"),
-    ]:
-        rdata, _ = await axi_read(dut, addr)
-        assert rdata == 0, f"{name} not cleared after reset: got 0x{rdata:08X}"
+    # 7) Reset mid-flight cancellation
+    await wr(0x04, 0x00000055, 0xF)
+    await wr(0x00, 0x1, 0x1)
+    await wait(PIPE_CYC // 4)
+    await reset()
+    await wait(PIPE_CYC + 10)
+    dout, _ = await rd(0x08)
+    stat, _ = await rd(0x0C)
+    ctrl, _ = await rd(0x00)
+    assert dout == 0 and stat == 0 and ctrl == 0, f"Reset cancellation failed dout={dout} st={stat} ctrl={ctrl}"
 
-    rdata, _ = await axi_read(dut, ADDR_STATUS)
-    assert rdata == 0, f"STATUS not cleared after reset: got 0x{rdata:08X}"
-
-
-# ---------------------------------------------------------------------------
-# Test 3 — 3-cycle pipeline, STATUS read-to-clear, CTRL self-clear
-# ---------------------------------------------------------------------------
-@cocotb.test()
-async def test_axi_lite_multiple_operations(dut):
-    """Pipeline result correct; STATUS.done is read-to-clear (not level);
-    CTRL[0] self-clears; multiple sequential operations."""
-    clock = Clock(dut.ACLK, 10, unit="ns")
-    clock.start(start_high=False)
-    await reset_dut(dut)
-
-    test_vectors = [
-        0x0000_0000,
-        0xFFFF_FFFF,
-        0x1234_5678,
-        0xA5A5_A5A5,
-        0x0000_0001,
-        0x8000_0000,
-    ]
-
-    for val in test_vectors:
-        await axi_write(dut, ADDR_DATA_IN, val)
-        await axi_write(dut, ADDR_CTRL, CTRL_START)
-
-        # wait_done consumes the done bit (read-to-clear)
-        await wait_done(dut, timeout=60)
-
-        # Verify DATA_OUT
-        rdata, _ = await axi_read(dut, ADDR_DATA_OUT)
-        exp = compute_result(val)
-        assert rdata == exp, \
-            f"DATA_IN=0x{val:08X}: DATA_OUT=0x{rdata:08X}, expected 0x{exp:08X}"
-
-        # STATUS.done must now be 0 (was cleared by wait_done read)
-        rdata, _ = await axi_read(dut, ADDR_STATUS)
-        assert (rdata & 1) == 0, \
-            f"STATUS.done should be cleared after read, got 0x{rdata:08X}"
-
-        # CTRL[0] self-cleared
-        rdata, _ = await axi_read(dut, ADDR_CTRL)
-        assert (rdata & 1) == 0, \
-            f"CTRL[0] should self-clear, got 0x{rdata:08X}"
-
-
-# ---------------------------------------------------------------------------
-# Test 4 — Accumulator, IRQ, byte strobes, back-to-back
-# ---------------------------------------------------------------------------
-@cocotb.test()
-async def test_axi_lite_back_to_back(dut):
-    """acc_en accumulates; IRQ latches on done and clears on read;
-    byte strobes; back-to-back read/write consistency."""
-    clock = Clock(dut.ACLK, 10, unit="ns")
-    clock.start(start_high=False)
-    await reset_dut(dut)
-
-    # ---- Accumulator mode: two triggers ----
-    await axi_write(dut, ADDR_DATA_IN, 0x0000_0010)
-    await axi_write(dut, ADDR_CTRL, CTRL_START | CTRL_ACC_EN | CTRL_IRQ_EN)
-    await wait_done(dut)
-
-    first_result = compute_result(0x0000_0010)
-    rdata, _ = await axi_read(dut, ADDR_DATA_OUT)
-    assert rdata == first_result, \
-        f"1st acc trigger: expected 0x{first_result:08X}, got 0x{rdata:08X}"
-
-    await axi_write(dut, ADDR_DATA_IN, 0x0000_0020)
-    await axi_write(dut, ADDR_CTRL, CTRL_START | CTRL_ACC_EN | CTRL_IRQ_EN)
-    await wait_done(dut)
-
-    second_result = compute_result(0x0000_0020)
-    expected_acc  = (first_result + second_result) & 0xFFFF_FFFF
-    rdata, _ = await axi_read(dut, ADDR_DATA_OUT)
-    assert rdata == expected_acc, \
-        f"2nd acc trigger: expected 0x{expected_acc:08X}, got 0x{rdata:08X}"
-
-    # ---- IRQ_STATUS read-to-clear ----
-    rdata, _ = await axi_read(dut, ADDR_IRQ_STATUS)
-    assert (rdata & 1) == 1, \
-        f"IRQ_STATUS[0] should be set after irq_en trigger, got 0x{rdata:08X}"
-    rdata, _ = await axi_read(dut, ADDR_IRQ_STATUS)
-    assert (rdata & 1) == 0, \
-        f"IRQ_STATUS[0] should clear after read, got 0x{rdata:08X}"
-
-    # ---- Non-accumulating mode overwrites ----
-    await axi_write(dut, ADDR_DATA_IN, 0x0000_0030)
-    await axi_write(dut, ADDR_CTRL, CTRL_START)
-    await wait_done(dut)
-
-    overwrite_result = compute_result(0x0000_0030)
-    rdata, _ = await axi_read(dut, ADDR_DATA_OUT)
-    assert rdata == overwrite_result, \
-        f"Normal mode after acc: expected 0x{overwrite_result:08X}, got 0x{rdata:08X}"
-
-    # ---- Byte strobe on SCRATCH ----
-    await axi_write(dut, ADDR_SCRATCH, 0xFFFF_FFFF, strb=0xF)
-    await axi_write(dut, ADDR_SCRATCH, 0x0000_00AB, strb=0x1)
-    rdata, _ = await axi_read(dut, ADDR_SCRATCH)
-    assert rdata == 0xFFFF_FFAB, \
-        f"SCRATCH low-byte strobe: expected 0xFFFFFFAB, got 0x{rdata:08X}"
-
-    await axi_write(dut, ADDR_SCRATCH, 0x0000_0000, strb=0xF)
-    await axi_write(dut, ADDR_SCRATCH, 0xCD00_0000, strb=0x8)
-    rdata, _ = await axi_read(dut, ADDR_SCRATCH)
-    assert rdata == 0xCD00_0000, \
-        f"SCRATCH high-byte strobe: expected 0xCD000000, got 0x{rdata:08X}"
-
-    # ---- Byte strobe on DATA_IN ----
-    await axi_write(dut, ADDR_DATA_IN, 0xFFFF_FFFF, strb=0xF)
-    await axi_write(dut, ADDR_DATA_IN, 0x0000_00EF, strb=0x1)
-    rdata, _ = await axi_read(dut, ADDR_DATA_IN)
-    assert rdata == 0xFFFF_FFEF, \
-        f"DATA_IN low-byte strobe: expected 0xFFFFFFEF, got 0x{rdata:08X}"
-
-    # ---- Back-to-back reads consistent ----
-    await axi_write(dut, ADDR_SCRATCH, 0xABCD_1234, strb=0xF)
-    r1, _ = await axi_read(dut, ADDR_SCRATCH)
-    r2, _ = await axi_read(dut, ADDR_SCRATCH)
-    assert r1 == r2 == 0xABCD_1234, \
-        f"Back-to-back reads inconsistent: r1=0x{r1:08X}, r2=0x{r2:08X}"
-
-    # ---- Back-to-back writes: last wins ----
-    await axi_write(dut, ADDR_SCRATCH, 0xAAAA_AAAA)
-    await axi_write(dut, ADDR_SCRATCH, 0x5555_5555)
-    rdata, _ = await axi_read(dut, ADDR_SCRATCH)
-    assert rdata == 0x5555_5555, \
-        f"Back-to-back writes: expected 0x55555555, got 0x{rdata:08X}"
-
-
-# ---------------------------------------------------------------------------
-# Runner
-# ---------------------------------------------------------------------------
-def test_axi_lite_slave_hidden_runner():
-    sim = os.getenv("SIM", "icarus")
-    proj_path = Path(__file__).resolve().parent.parent
-    sources = [proj_path / "sources" / "axi_lite_slave.sv"]
-
-    runner = get_runner(sim)
-    runner.build(
-        sources=sources,
-        hdl_toplevel="axi_lite_slave",
-        always=True,
-    )
-    runner.test(
-        hdl_toplevel="axi_lite_slave",
-        test_module="test_axi_lite_slave_hidden",
-    )
+    # 8) Final clean run should compute correctly with full latency
+    await wr(0x04, 0x0000002A, 0xF)
+    await wr(0x00, 0x1, 0x1)
+    await wait(PIPE_CYC + 12)
+    final, rr = await rd(0x08)
+    assert rr == 0, f"RRESP expected OKAY, got {rr}"
+    assert final == exp(0x2A), f"Final result wrong: got {final}, expected {exp(0x2A)}"
