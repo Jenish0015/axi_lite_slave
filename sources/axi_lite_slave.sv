@@ -1,286 +1,218 @@
+`timescale 1ns / 1ps
 
+module axi_lite_slave #(
+    parameter DATA_WIDTH = 32,
+    parameter ADDR_WIDTH = 6
+)(
+    input  wire                   ACLK,
+    input  wire                   ARESETn,
+    input  wire [ADDR_WIDTH-1:0]  AWADDR,
+    input  wire                   AWVALID,
+    output reg                    AWREADY,
+    input  wire [DATA_WIDTH-1:0]  WDATA,
+    input  wire [3:0]             WSTRB,
+    input  wire                   WVALID,
+    output reg                    WREADY,
+    output reg [1:0]              BRESP,
+    output reg                    BVALID,
+    input  wire                   BREADY,
+    input  wire [ADDR_WIDTH-1:0]  ARADDR,
+    input  wire                   ARVALID,
+    output reg                    ARREADY,
+    output reg [DATA_WIDTH-1:0]   RDATA,
+    output reg [1:0]              RRESP,
+    output reg                    RVALID,
+    input  wire                   RREADY
+);
 
-`timescale 1ns/1ps
+    localparam [ADDR_WIDTH-1:0] ADDR_CTRL       = 6'h00;
+    localparam [ADDR_WIDTH-1:0] ADDR_DATA_IN    = 6'h04;
+    localparam [ADDR_WIDTH-1:0] ADDR_DATA_OUT   = 6'h08;
+    localparam [ADDR_WIDTH-1:0] ADDR_STATUS     = 6'h0C;
+    localparam [ADDR_WIDTH-1:0] ADDR_SCRATCH    = 6'h10;
+    localparam [ADDR_WIDTH-1:0] ADDR_IRQ_STATUS = 6'h14;
 
-module tb_axi_lite_slave;
+    localparam [1:0] W_IDLE = 2'd0, W_DATA = 2'd1, W_RESP = 2'd2;
+    localparam [1:0] R_IDLE = 2'd0, R_DATA = 2'd1;
 
-    localparam DATA_WIDTH = 32;
-    localparam ADDR_WIDTH = 6;
-    localparam CLK_PERIOD = 10;
+    reg [31:0] ctrl_reg;
+    reg [31:0] data_in_reg;
+    reg [31:0] data_out_reg;
+    reg [31:0] status_reg;
+    reg [31:0] scratch_reg;
+    reg [31:0] irq_status_reg;
 
-    localparam [ADDR_WIDTH-1:0] ADDR_CTRL     = 6'h00;
-    localparam [ADDR_WIDTH-1:0] ADDR_DATA_IN  = 6'h04;
-    localparam [ADDR_WIDTH-1:0] ADDR_DATA_OUT = 6'h08;
-    localparam [ADDR_WIDTH-1:0] ADDR_STATUS   = 6'h0C;
+    reg [1:0]            wstate;
+    reg [ADDR_WIDTH-1:0] waddr;
+    reg [1:0]            rstate;
+    reg [ADDR_WIDTH-1:0] raddr;
 
-    logic                   ACLK;
-    logic                   ARESETn;
+    reg        busy;
+    reg [1:0]  comp_wait;
+    reg        pending_acc_en;
+    reg        pending_irq_en;
+    reg [31:0] pending_result;
 
-    logic [ADDR_WIDTH-1:0]  AWADDR;
-    logic                   AWVALID;
-    logic                   AWREADY;
+    wire w_done = (wstate == W_DATA) && WVALID && WREADY;
+    wire [32:0] sum33 = {1'b0, data_in_reg ^ 32'hA5A5A5A5} + {1'b0, data_in_reg};
+    wire [31:0] compute_result = sum33[32:2];
 
-    logic [DATA_WIDTH-1:0]  WDATA;
-    logic [3:0]             WSTRB;
-    logic                   WVALID;
-    logic                   WREADY;
-
-    logic [1:0]             BRESP;
-    logic                   BVALID;
-    logic                   BREADY;
-
-    logic [ADDR_WIDTH-1:0]  ARADDR;
-    logic                   ARVALID;
-    logic                   ARREADY;
-
-    logic [DATA_WIDTH-1:0]  RDATA;
-    logic [1:0]             RRESP;
-    logic                   RVALID;
-    logic                   RREADY;
-
-    axi_lite_slave #(
-        .DATA_WIDTH(DATA_WIDTH),
-        .ADDR_WIDTH(ADDR_WIDTH)
-    ) dut (
-        .ACLK    (ACLK),
-        .ARESETn (ARESETn),
-        .AWADDR  (AWADDR),
-        .AWVALID (AWVALID),
-        .AWREADY (AWREADY),
-        .WDATA   (WDATA),
-        .WSTRB   (WSTRB),
-        .WVALID  (WVALID),
-        .WREADY  (WREADY),
-        .BRESP   (BRESP),
-        .BVALID  (BVALID),
-        .BREADY  (BREADY),
-        .ARADDR  (ARADDR),
-        .ARVALID (ARVALID),
-        .ARREADY (ARREADY),
-        .RDATA   (RDATA),
-        .RRESP   (RRESP),
-        .RVALID  (RVALID),
-        .RREADY  (RREADY)
-    );
-
-    initial ACLK = 0;
-    always #(CLK_PERIOD/2) ACLK = ~ACLK;
-
-    int pass_count = 0;
-    int fail_count = 0;
-
-    task automatic check(
-        input string       label,
-        input logic [31:0] got,
-        input logic [31:0] exp
-    );
-        if (got === exp) begin
-            $display("  PASS  %s : got=0x%08X", label, got);
-            pass_count++;
+    // Write channel FSM
+    always @(posedge ACLK or negedge ARESETn) begin
+        if (!ARESETn) begin
+            wstate  <= W_IDLE;
+            AWREADY <= 1'b1;
+            WREADY  <= 1'b0;
+            BVALID  <= 1'b0;
+            BRESP   <= 2'b00;
+            waddr   <= {ADDR_WIDTH{1'b0}};
         end else begin
-            $display("  FAIL  %s : got=0x%08X  exp=0x%08X", label, got, exp);
-            fail_count++;
+            case (wstate)
+                W_IDLE: begin
+                    BVALID <= 1'b0;
+                    if (AWVALID && AWREADY) begin
+                        waddr   <= AWADDR;
+                        AWREADY <= 1'b0;
+                        WREADY  <= 1'b1;
+                        wstate  <= W_DATA;
+                    end
+                end
+                W_DATA: begin
+                    if (WVALID && WREADY) begin
+                        WREADY <= 1'b0;
+                        case (waddr)
+                            ADDR_CTRL, ADDR_DATA_IN, ADDR_DATA_OUT, ADDR_STATUS, ADDR_SCRATCH, ADDR_IRQ_STATUS:
+                                BRESP <= 2'b00;
+                            default:
+                                BRESP <= 2'b10;
+                        endcase
+                        BVALID <= 1'b1;
+                        wstate <= W_RESP;
+                    end
+                end
+                W_RESP: begin
+                    if (BVALID && BREADY) begin
+                        BVALID  <= 1'b0;
+                        AWREADY <= 1'b1;
+                        wstate  <= W_IDLE;
+                    end
+                end
+                default: wstate <= W_IDLE;
+            endcase
         end
-    endtask
-
-    task automatic axi_write(
-        input  logic [ADDR_WIDTH-1:0] addr,
-        input  logic [DATA_WIDTH-1:0] data,
-        input  logic [3:0]            strb,
-        output logic [1:0]            resp
-    );
-        @(posedge ACLK);
-        AWADDR  <= addr;
-        AWVALID <= 1'b1;
-        WDATA   <= data;
-        WSTRB   <= strb;
-        WVALID  <= 1'b1;
-
-        do @(posedge ACLK); while (!AWREADY);
-        AWVALID <= 1'b0;
-
-        do @(posedge ACLK); while (!WREADY);
-        WVALID  <= 1'b0;
-
-        BREADY  <= 1'b1;
-        do @(posedge ACLK); while (!BVALID);
-        resp    = BRESP;
-        @(posedge ACLK);
-        BREADY  <= 1'b0;
-    endtask
-
-    task automatic axi_read(
-        input  logic [ADDR_WIDTH-1:0] addr,
-        output logic [DATA_WIDTH-1:0] data,
-        output logic [1:0]            resp
-    );
-        @(posedge ACLK);
-        ARADDR  <= addr;
-        ARVALID <= 1'b1;
-
-        do @(posedge ACLK); while (!ARREADY);
-        ARVALID <= 1'b0;
-
-        RREADY  <= 1'b1;
-        do @(posedge ACLK); while (!RVALID);
-        data    = RDATA;
-        resp    = RRESP;
-        @(posedge ACLK);
-        RREADY  <= 1'b0;
-    endtask
-
-    function automatic logic [31:0] compute_expected(input logic [31:0] val);
-        logic [32:0] sum;
-        sum = {1'b0, val ^ 32'hA5A5A5A5} + {1'b0, val};
-        return (sum & 33'h1_FFFF_FFFF) >> 2;
-    endfunction
-
-    logic [31:0] rdata;
-    logic [1:0]  rresp, wresp;
-    logic [31:0] snap_data_out;
-    logic [31:0] snap_status;
-    int          poll_count;
-
-    initial begin
-        ARESETn <= 1'b0;
-        AWADDR  <= '0; AWVALID <= 1'b0;
-        WDATA   <= '0; WSTRB   <= 4'hF; WVALID <= 1'b0;
-        BREADY  <= 1'b0;
-        ARADDR  <= '0; ARVALID <= 1'b0;
-        RREADY  <= 1'b0;
-
-        repeat(5) @(posedge ACLK);
-        ARESETn <= 1'b1;
-        repeat(2) @(posedge ACLK);
-
-        $display("\n[TC1] Reset defaults");
-        axi_read(ADDR_CTRL,     rdata, rresp); check("CTRL     reset", rdata, 32'h0);
-        axi_read(ADDR_DATA_IN,  rdata, rresp); check("DATA_IN  reset", rdata, 32'h0);
-        axi_read(ADDR_DATA_OUT, rdata, rresp); check("DATA_OUT reset", rdata, 32'h0);
-        axi_read(ADDR_STATUS,   rdata, rresp); check("STATUS   reset", rdata, 32'h0);
-
-        $display("\n[TC2] Write / read DATA_IN");
-        axi_write(ADDR_DATA_IN, 32'hDEAD_BEEF, 4'hF, wresp);
-        check("BRESP OKAY",       {30'b0, wresp}, 32'h0);
-        axi_read(ADDR_DATA_IN,   rdata, rresp);
-        check("DATA_IN readback", rdata, 32'hDEAD_BEEF);
-
-        $display("\n[TC3] Computation — trigger, poll STATUS, read DATA_OUT");
-        axi_write(ADDR_DATA_IN, 32'h1234_5678, 4'hF, wresp);
-        axi_write(ADDR_CTRL,    32'h0000_0001, 4'hF, wresp);
-
-        poll_count = 0;
-        do begin
-            axi_read(ADDR_STATUS, rdata, rresp);
-            poll_count++;
-            if (poll_count > 30) begin
-                $display("  FAIL  STATUS.done never set after 30 polls");
-                fail_count++;
-                disable fork;
-            end
-        end while (rdata[0] !== 1'b1);
-        check("STATUS.done=1", rdata[0:0], 1'b1);
-        $display("        done after %0d poll(s)", poll_count);
-
-        $display("\n[TC4] Result correctness");
-        axi_read(ADDR_DATA_OUT, rdata, rresp);
-        check("DATA_OUT value", rdata, compute_expected(32'h1234_5678));
-
-        $display("\n[TC5] CTRL auto-cleared after start");
-        axi_read(ADDR_CTRL, rdata, rresp);
-        check("CTRL[0] self-cleared", rdata[0:0], 1'b0);
-
-        $display("\n[TC6] Re-trigger with new DATA_IN");
-        axi_write(ADDR_DATA_IN, 32'hFFFF_FFFF, 4'hF, wresp);
-        axi_write(ADDR_CTRL,    32'h0000_0001, 4'hF, wresp);
-
-        poll_count = 0;
-        do begin
-            axi_read(ADDR_STATUS, rdata, rresp);
-            poll_count++;
-            if (poll_count > 30) begin
-                $display("  FAIL  STATUS.done never set on re-trigger");
-                fail_count++;
-                disable fork;
-            end
-        end while (rdata[0] !== 1'b1);
-        check("STATUS.done=1 (re-trigger)", rdata[0:0], 1'b1);
-        axi_read(ADDR_DATA_OUT, rdata, rresp);
-        check("DATA_OUT re-trigger value", rdata, compute_expected(32'hFFFF_FFFF));
-
-        $display("\n[TC7] RO register write protection");
-        axi_read(ADDR_DATA_OUT, snap_data_out, rresp);
-        axi_read(ADDR_STATUS,   snap_status,   rresp);
-        axi_write(ADDR_DATA_OUT, 32'hFFFF_FFFF, 4'hF, wresp);
-        axi_write(ADDR_STATUS,   32'hFFFF_FFFF, 4'hF, wresp);
-        axi_read(ADDR_DATA_OUT, rdata, rresp);
-        check("DATA_OUT unchanged", rdata, snap_data_out);
-        axi_read(ADDR_STATUS, rdata, rresp);
-        check("STATUS   unchanged", rdata, snap_status);
-
-        $display("\n[TC8] Back-to-back writes");
-        axi_write(ADDR_DATA_IN, 32'hAAAA_AAAA, 4'hF, wresp);
-        axi_write(ADDR_DATA_IN, 32'h5555_5555, 4'hF, wresp);
-        axi_read(ADDR_DATA_IN, rdata, rresp);
-        check("DATA_IN final value", rdata, 32'h5555_5555);
-
-        $display("\n[TC9] Back-to-back reads");
-        axi_write(ADDR_DATA_IN, 32'hCAFE_F00D, 4'hF, wresp);
-        axi_read(ADDR_DATA_IN, rdata, rresp); check("BBR read 1",    rdata, 32'hCAFE_F00D);
-        axi_read(ADDR_DATA_IN, rdata, rresp); check("BBR read 2",    rdata, 32'hCAFE_F00D);
-        axi_read(ADDR_CTRL,    rdata, rresp); check("BBR read 3 CTRL", rdata, 32'h0);
-
-        $display("\n[TC10] Byte-strobe low byte only");
-        axi_write(ADDR_DATA_IN, 32'hFFFF_FFFF, 4'hF, wresp);
-        axi_write(ADDR_DATA_IN, 32'h0000_00AB, 4'h1, wresp);
-        axi_read(ADDR_DATA_IN, rdata, rresp);
-        check("Low byte only updated", rdata, 32'hFFFF_FFAB);
-
-        $display("\n[TC11] Byte-strobe high byte only");
-        axi_write(ADDR_DATA_IN, 32'h0000_0000, 4'hF, wresp);
-        axi_write(ADDR_DATA_IN, 32'hCD000000,  4'h8, wresp);
-        axi_read(ADDR_DATA_IN, rdata, rresp);
-        check("High byte only updated", rdata, 32'hCD00_0000);
-
-        $display("\n[TC12] Unmapped address returns SLVERR");
-        axi_read(6'h3C, rdata, rresp);
-        check("RRESP=SLVERR", {30'b0, rresp}, 32'h2);
-        check("RDATA=0",      rdata,           32'h0);
-
-        $display("\n[TC13] STATUS cleared when new start issued");
-        axi_write(ADDR_DATA_IN, 32'h0000_0001, 4'hF, wresp);
-        axi_write(ADDR_CTRL,    32'h0000_0001, 4'hF, wresp);
-        poll_count = 0;
-        do begin
-            axi_read(ADDR_STATUS, rdata, rresp);
-            poll_count++;
-            if (poll_count > 30) begin
-                $display("  FAIL  STATUS.done never set (TC13)");
-                fail_count++;
-                disable fork;
-            end
-        end while (rdata[0] !== 1'b1);
-        axi_write(ADDR_DATA_IN, 32'h0000_0002, 4'hF, wresp);
-        axi_write(ADDR_CTRL,    32'h0000_0001, 4'hF, wresp);
-        axi_read(ADDR_STATUS, rdata, rresp);
-        check("STATUS cleared on new start", rdata[0:0], 1'b0);
-
-        repeat(4) @(posedge ACLK);
-        $display("\n========================================");
-        $display("  Results : %0d PASSED  /  %0d FAILED", pass_count, fail_count);
-        $display("========================================\n");
-        if (fail_count == 0)
-            $display("ALL TESTS PASSED");
-        else
-            $display("SOME TESTS FAILED — review log above");
-
-        $finish;
     end
 
-    initial begin
-        #(CLK_PERIOD * 20_000);
-        $display("ERROR: simulation timeout");
-        $finish;
+    // Read channel FSM
+    always @(posedge ACLK or negedge ARESETn) begin
+        if (!ARESETn) begin
+            rstate   <= R_IDLE;
+            ARREADY  <= 1'b1;
+            RVALID   <= 1'b0;
+            RDATA    <= 32'b0;
+            RRESP    <= 2'b00;
+            raddr    <= {ADDR_WIDTH{1'b0}};
+        end else begin
+            case (rstate)
+                R_IDLE: begin
+                    RVALID <= 1'b0;
+                    if (ARVALID && ARREADY) begin
+                        ARREADY <= 1'b0;
+                        raddr   <= ARADDR;
+                        case (ARADDR)
+                            ADDR_CTRL:       begin RDATA <= ctrl_reg;       RRESP <= 2'b00; end
+                            ADDR_DATA_IN:    begin RDATA <= data_in_reg;    RRESP <= 2'b00; end
+                            ADDR_DATA_OUT:   begin RDATA <= data_out_reg;   RRESP <= 2'b00; end
+                            ADDR_STATUS:     begin RDATA <= status_reg;     RRESP <= 2'b00; end
+                            ADDR_SCRATCH:    begin RDATA <= scratch_reg;    RRESP <= 2'b00; end
+                            ADDR_IRQ_STATUS: begin RDATA <= irq_status_reg; RRESP <= 2'b00; end
+                            default:         begin RDATA <= 32'b0;          RRESP <= 2'b10; end
+                        endcase
+                        RVALID <= 1'b1;
+                        rstate <= R_DATA;
+                    end
+                end
+                R_DATA: begin
+                    if (RREADY && RVALID) begin
+                        RVALID  <= 1'b0;
+                        ARREADY <= 1'b1;
+                        rstate  <= R_IDLE;
+                    end
+                end
+                default: rstate <= R_IDLE;
+            endcase
+        end
+    end
+
+    // Registers and datapath
+    always @(posedge ACLK or negedge ARESETn) begin
+        if (!ARESETn) begin
+            ctrl_reg       <= 32'b0;
+            data_in_reg    <= 32'b0;
+            data_out_reg   <= 32'b0;
+            status_reg     <= 32'b0;
+            scratch_reg    <= 32'b0;
+            irq_status_reg <= 32'b0;
+            busy           <= 1'b0;
+            comp_wait      <= 2'd0;
+            pending_acc_en <= 1'b0;
+            pending_irq_en <= 1'b0;
+            pending_result <= 32'b0;
+        end else begin
+            // Bus writes
+            if (w_done) begin
+                case (waddr)
+                    ADDR_CTRL: begin
+                        if (WSTRB[0]) ctrl_reg[2:0] <= WDATA[2:0];
+                        status_reg[0] <= 1'b0;
+                    end
+                    ADDR_DATA_IN: begin
+                        if (WSTRB[0]) data_in_reg[7:0]   <= WDATA[7:0];
+                        if (WSTRB[1]) data_in_reg[15:8]  <= WDATA[15:8];
+                        if (WSTRB[2]) data_in_reg[23:16] <= WDATA[23:16];
+                        if (WSTRB[3]) data_in_reg[31:24] <= WDATA[31:24];
+                    end
+                    ADDR_SCRATCH: begin
+                        if (WSTRB[0]) scratch_reg[7:0]   <= WDATA[7:0];
+                        if (WSTRB[1]) scratch_reg[15:8]  <= WDATA[15:8];
+                        if (WSTRB[2]) scratch_reg[23:16] <= WDATA[23:16];
+                        if (WSTRB[3]) scratch_reg[31:24] <= WDATA[31:24];
+                    end
+                    default: begin
+                        // RO and unmapped: no register mutation
+                    end
+                endcase
+            end
+
+            // Launch operation on start pulse when idle
+            if (!busy && ctrl_reg[0]) begin
+                busy           <= 1'b1;
+                comp_wait      <= 2'd2;
+                pending_acc_en <= ctrl_reg[1];
+                pending_irq_en <= ctrl_reg[2];
+                pending_result <= compute_result;
+                ctrl_reg[0]    <= 1'b0; // self-clear START
+                status_reg[0]  <= 1'b0;
+            end else if (busy && (comp_wait != 2'd0)) begin
+                comp_wait <= comp_wait - 2'd1;
+            end else if (busy && (comp_wait == 2'd0)) begin
+                busy <= 1'b0;
+                if (pending_acc_en)
+                    data_out_reg <= data_out_reg + pending_result;
+                else
+                    data_out_reg <= pending_result;
+                status_reg[0] <= 1'b1;
+                if (pending_irq_en)
+                    irq_status_reg[0] <= 1'b1;
+            end
+
+            // Read-to-clear semantics
+            if ((rstate == R_DATA) && RVALID && RREADY && (RRESP == 2'b00)) begin
+                if ((raddr == ADDR_STATUS) && RDATA[0])
+                    status_reg[0] <= 1'b0;
+                if ((raddr == ADDR_IRQ_STATUS) && RDATA[0])
+                    irq_status_reg[0] <= 1'b0;
+            end
+        end
     end
 
 endmodule
