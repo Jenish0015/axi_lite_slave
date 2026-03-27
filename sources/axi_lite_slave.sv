@@ -1,13 +1,4 @@
 `timescale 1us/1us
-
-module dff (
-    input  logic clk,
-    input  logic d,
-    output logic q
-);
-    // Internal logic
-endmodule
-
 module axi_lite_slave (
     // Global signals
     input  logic        ACLK,
