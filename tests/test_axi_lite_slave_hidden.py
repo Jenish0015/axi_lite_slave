@@ -232,7 +232,7 @@ async def test_axi_lite_slave_hidden(dut):
 def test_axi_lite_slave_hidden_runner():
     sim = os.getenv("SIM", "icarus")
     proj_path = Path(__file__).resolve().parent.parent
-    sources = [proj_path / "golden/axi_lite_slave.sv"]
+    sources = [proj_path / "sources/axi_lite_slave.sv"]
     runner = get_runner(sim)
     runner.build(
         sources=sources,
