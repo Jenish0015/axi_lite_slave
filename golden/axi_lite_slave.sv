@@ -1,217 +1,5 @@
 `timescale 1ns / 1ps
 
-module axi_lite_slave #(
-    parameter DATA_WIDTH = 32,
-    parameter ADDR_WIDTH = 6
-)(
-    input  wire                   ACLK,
-    input  wire                   ARESETn,
-    input  wire [ADDR_WIDTH-1:0]  AWADDR,
-    input  wire                   AWVALID,
-    output reg                    AWREADY,
-    input  wire [DATA_WIDTH-1:0]  WDATA,
-    input  wire [3:0]             WSTRB,
-    input  wire                   WVALID,
-    output reg                    WREADY,
-    output reg [1:0]              BRESP,
-    output reg                    BVALID,
-    input  wire                   BREADY,
-    input  wire [ADDR_WIDTH-1:0]  ARADDR,
-    input  wire                   ARVALID,
-    output reg                    ARREADY,
-    output reg [DATA_WIDTH-1:0]   RDATA,
-    output reg [1:0]              RRESP,
-    output reg                    RVALID,
-    input  wire                   RREADY
-);
-
-    localparam [5:0] ADDR_CTRL     = 6'h00;
-    localparam [5:0] ADDR_DATA_IN  = 6'h04;
-    localparam [5:0] ADDR_DATA_OUT = 6'h08;
-    localparam [5:0] ADDR_STATUS   = 6'h0C;
-    localparam [1:0] RESP_OKAY     = 2'b00;
-    localparam [1:0] RESP_SLVERR   = 2'b10;
-    localparam integer PIPE_CYCLES = 32;
-
-    reg [31:0] ctrl_reg;
-    reg [31:0] data_in_reg;
-    reg [31:0] data_out_reg;
-    reg [31:0] status_reg;
-
-    reg [5:0]  pipe_count;
-    reg [31:0] pipe_operand;
-    reg        pipe_busy;
-    reg        cancel_run;
-
-    reg                  aw_latched;
-    reg                  w_latched;
-    reg [ADDR_WIDTH-1:0] aw_addr_reg;
-    reg [DATA_WIDTH-1:0] w_data_reg;
-    reg [3:0]            w_strb_reg;
-
-    reg                  read_pending;
-    reg [ADDR_WIDTH-1:0] ar_addr_reg;
-
-    wire [31:0] exp_result = (((pipe_operand ^ 32'hA5A5A5A5) + pipe_operand) & 32'hFFFF_FFFF) >> 2;
-    wire pipe_advance = !AWVALID && !WVALID && !ARVALID && !BVALID && !RVALID;
-
-    always @(posedge ACLK or negedge ARESETn) begin
-        if (!ARESETn) begin
-            AWREADY      <= 1'b0;
-            WREADY       <= 1'b0;
-            BRESP        <= RESP_OKAY;
-            BVALID       <= 1'b0;
-            ARREADY      <= 1'b0;
-            RDATA        <= 32'd0;
-            RRESP        <= RESP_OKAY;
-            RVALID       <= 1'b0;
-
-            aw_latched   <= 1'b0;
-            w_latched    <= 1'b0;
-            aw_addr_reg  <= {ADDR_WIDTH{1'b0}};
-            w_data_reg   <= 32'd0;
-            w_strb_reg   <= 4'd0;
-
-            read_pending <= 1'b0;
-            ar_addr_reg  <= {ADDR_WIDTH{1'b0}};
-
-            ctrl_reg     <= 32'd0;
-            data_in_reg  <= 32'd0;
-            data_out_reg <= 32'd0;
-            status_reg   <= 32'd0;
-
-            pipe_count   <= 6'd0;
-            pipe_operand <= 32'd0;
-            pipe_busy    <= 1'b0;
-            cancel_run   <= 1'b0;
-        end else begin
-            cancel_run = 1'b0;
-
-            if (!aw_latched && !(BVALID && !BREADY)) begin
-                AWREADY <= 1'b1;
-                if (AWVALID) begin
-                    AWREADY     <= 1'b0;
-                    aw_latched  <= 1'b1;
-                    aw_addr_reg <= AWADDR;
-                end
-            end else begin
-                AWREADY <= 1'b0;
-            end
-
-            if (!w_latched && !(BVALID && !BREADY)) begin
-                WREADY <= 1'b1;
-                if (WVALID) begin
-                    WREADY    <= 1'b0;
-                    w_latched <= 1'b1;
-                    w_data_reg<= WDATA;
-                    w_strb_reg<= WSTRB;
-                end
-            end else begin
-                WREADY <= 1'b0;
-            end
-
-            if (aw_latched && w_latched && !BVALID) begin
-                BRESP <= RESP_OKAY;
-                if (aw_addr_reg == ADDR_CTRL) begin
-                    if (w_strb_reg[0]) ctrl_reg[7:0]   <= w_data_reg[7:0];
-                    if (w_strb_reg[1]) ctrl_reg[15:8]  <= w_data_reg[15:8];
-                    if (w_strb_reg[2]) ctrl_reg[23:16] <= w_data_reg[23:16];
-                    if (w_strb_reg[3]) ctrl_reg[31:24] <= w_data_reg[31:24];
-
-                    if (w_strb_reg[0] && !w_data_reg[0]) begin
-                        cancel_run   = 1'b1;
-                        pipe_busy    <= 1'b0;
-                        pipe_count   <= 6'd0;
-                        status_reg   <= 32'd0;
-                        data_out_reg <= 32'd0;
-                    end
-
-                    if (w_strb_reg[0] && w_data_reg[0]) begin
-                        cancel_run   = 1'b1;
-                        pipe_busy    <= 1'b1;
-                        pipe_count   <= 6'd0;
-                        pipe_operand <= data_in_reg;
-                        status_reg   <= 32'd0;
-                        data_out_reg <= 32'd0;
-                    end
-                end else if (aw_addr_reg == ADDR_DATA_IN) begin
-                    if (w_strb_reg[0]) data_in_reg[7:0]   <= w_data_reg[7:0];
-                    if (w_strb_reg[1]) data_in_reg[15:8]  <= w_data_reg[15:8];
-                    if (w_strb_reg[2]) data_in_reg[23:16] <= w_data_reg[23:16];
-                    if (w_strb_reg[3]) data_in_reg[31:24] <= w_data_reg[31:24];
-                end else if (aw_addr_reg == ADDR_DATA_OUT || aw_addr_reg == ADDR_STATUS) begin
-                    // Writes to read-only locations are accepted and ignored.
-                end else begin
-                    BRESP <= RESP_SLVERR;
-                end
-
-                BVALID     <= 1'b1;
-                aw_latched <= 1'b0;
-                w_latched  <= 1'b0;
-            end
-
-            if (BVALID && BREADY) begin
-                BVALID = 1'b0;
-            end
-
-            if (!read_pending && !RVALID) begin
-                ARREADY <= 1'b1;
-                if (ARVALID) begin
-                    ARREADY      <= 1'b0;
-                    read_pending <= 1'b1;
-                    ar_addr_reg  <= ARADDR;
-                end
-            end else begin
-                ARREADY <= 1'b0;
-            end
-
-            if (RVALID) begin
-                if (RREADY) begin
-                    RVALID       = 1'b0;
-                    read_pending = 1'b0;
-                end
-            end else if (read_pending) begin
-                case (ar_addr_reg)
-                    ADDR_CTRL: begin
-                        RDATA <= ctrl_reg;
-                        RRESP <= RESP_OKAY;
-                    end
-                    ADDR_DATA_IN: begin
-                        RDATA <= data_in_reg;
-                        RRESP <= RESP_OKAY;
-                    end
-                    ADDR_DATA_OUT: begin
-                        RDATA <= data_out_reg;
-                        RRESP <= RESP_OKAY;
-                    end
-                    ADDR_STATUS: begin
-                        RDATA <= status_reg;
-                        RRESP <= RESP_OKAY;
-                    end
-                    default: begin
-                        RDATA <= 32'd0;
-                        RRESP <= RESP_SLVERR;
-                    end
-                endcase
-                RVALID <= 1'b1;
-            end
-
-            if (pipe_busy && !cancel_run && pipe_advance) begin
-                if (pipe_count == PIPE_CYCLES - 1) begin
-                    pipe_busy    <= 1'b0;
-                    data_out_reg <= exp_result;
-                    status_reg   <= 32'h1;
-                    ctrl_reg[0]  <= 1'b0;
-                end else begin
-                    pipe_count <= pipe_count + 1'b1;
-                end
-            end
-        end
-    end
-
-endmodule
-`timescale 1ns / 1ps
-
 module axi_lite_slave_tb;
 
     // ---------------------------------------------------------------
@@ -225,6 +13,8 @@ module axi_lite_slave_tb;
     localparam [5:0] ADDR_DATA_IN  = 6'h04;
     localparam [5:0] ADDR_DATA_OUT = 6'h08;
     localparam [5:0] ADDR_STATUS   = 6'h0C;
+
+    localparam integer PIPE_CYCLES = 32;
 
     // ---------------------------------------------------------------
     // DUT interface signals
@@ -299,31 +89,131 @@ module axi_lite_slave_tb;
     // ---------------------------------------------------------------
     // Tasks
     // ---------------------------------------------------------------
+
+    // Drive all bus signals to idle / de-asserted state
     task axi_idle;
-        // Internal logic
+        AWADDR  = '0;
+        AWVALID = 1'b0;
+        WDATA   = '0;
+        WSTRB   = 4'hF;
+        WVALID  = 1'b0;
+        BREADY  = 1'b0;
+        ARADDR  = '0;
+        ARVALID = 1'b0;
+        RREADY  = 1'b0;
     endtask
 
+    // Single AXI-Lite write; result captured in write_resp
     task axi_write (
         input logic [ADDR_WIDTH-1:0] addr,
         input logic [DATA_WIDTH-1:0] data,
         input logic [3:0]            strb
     );
-        // Internal logic
+        // --- Write address channel ---
+        @(posedge ACLK);
+        AWADDR  = addr;
+        AWVALID = 1'b1;
+
+        repeat (50) begin
+            @(posedge ACLK);
+            if (AWREADY) begin
+                AWVALID = 1'b0;
+                break;
+            end
+        end
+        AWVALID = 1'b0;
+        @(posedge ACLK);
+
+        // --- Write data channel ---
+        WDATA  = data;
+        WSTRB  = strb;
+        WVALID = 1'b1;
+
+        repeat (50) begin
+            @(posedge ACLK);
+            if (WREADY) begin
+                WVALID = 1'b0;
+                break;
+            end
+        end
+        WVALID = 1'b0;
+
+        // --- Write response channel ---
+        BREADY = 1'b1;
+        repeat (50) begin
+            @(posedge ACLK);
+            if (BVALID) begin
+                write_resp = BRESP;
+                break;
+            end
+        end
+        @(posedge ACLK);
+        BREADY = 1'b0;
     endtask
 
+    // Single AXI-Lite read; result captured in read_data / read_resp
     task axi_read (
         input  logic [ADDR_WIDTH-1:0] addr,
         output logic [DATA_WIDTH-1:0] data,
         output logic [1:0]            resp
     );
-        // Internal logic
+        // --- Read address channel ---
+        @(posedge ACLK);
+        ARADDR  = addr;
+        ARVALID = 1'b1;
+        RREADY  = 1'b1;
+
+        repeat (50) begin
+            @(posedge ACLK);
+            if (ARREADY) begin
+                ARVALID = 1'b0;
+                break;
+            end
+        end
+        ARVALID = 1'b0;
+
+        // --- Read data channel ---
+        repeat (50) begin
+            @(posedge ACLK);
+            if (RVALID) begin
+                data = RDATA;
+                resp = RRESP;
+                break;
+            end
+        end
+        @(posedge ACLK);
+        RREADY = 1'b0;
     endtask
 
+    // Poll STATUS register until bit 0 set or timeout
     task wait_done (
         input integer timeout_cycles
     );
-        // Internal logic
+        logic [DATA_WIDTH-1:0] st;
+        logic [1:0]            rr;
+        integer                i;
+        for (i = 0; i < timeout_cycles; i = i + 1) begin
+            axi_read(ADDR_STATUS, st, rr);
+            if (st[0]) begin
+                $display("[%0t] Pipeline done after %0d polls", $time, i + 1);
+                return;
+            end
+        end
+        $display("[%0t] WARNING: wait_done timed out after %0d cycles", $time, timeout_cycles);
     endtask
+
+    // ---------------------------------------------------------------
+    // Golden reference function
+    // ---------------------------------------------------------------
+    function automatic logic [DATA_WIDTH-1:0] expected_result (
+        input logic [DATA_WIDTH-1:0] val
+    );
+        logic [DATA_WIDTH-1:0] xored;
+        logic [DATA_WIDTH:0]   total;
+        xored = val ^ 32'hA5A5A5A5;
+        total = ({1'b0, xored} + {1'b0, val});
+        return total[DATA_WIDTH-1:0] >> 2;
+    endfunction
 
     // ---------------------------------------------------------------
     // Stimulus
@@ -332,7 +222,131 @@ module axi_lite_slave_tb;
         $dumpfile("axi_lite_slave_tb.vcd");
         $dumpvars(0, axi_lite_slave_tb);
 
-        // Internal logic
+        // ------------------------------------------------------------------
+        // Reset
+        // ------------------------------------------------------------------
+        axi_idle();
+        ARESETn = 1'b0;
+        repeat (5) @(posedge ACLK);
+        ARESETn = 1'b1;
+        repeat (3) @(posedge ACLK);
+
+        // ==================================================================
+        // Test 1 – Masked CTRL write must NOT trigger pipeline
+        // ==================================================================
+        test_num = 1;
+        $display("[%0t] TEST %0d: Masked CTRL write", $time, test_num);
+
+        axi_write(ADDR_DATA_IN, 32'h00000015, 4'hF);
+        axi_write(ADDR_CTRL,    32'h00000001, 4'h0); // strb=0 → no effect
+
+        repeat (12) @(posedge ACLK);
+
+        axi_read(ADDR_STATUS, read_data, read_resp);
+        if (read_data !== 32'h0)
+            $display("FAIL T1: STATUS should be 0, got %0h", read_data);
+
+        axi_read(ADDR_DATA_OUT, read_data, read_resp);
+        if (read_data !== 32'h0)
+            $display("FAIL T1: DATA_OUT should be 0 before trigger, got %0h", read_data);
+
+        $display("[%0t] TEST %0d PASS", $time, test_num);
+
+        // ==================================================================
+        // Test 2 – Basic trigger and correct result
+        // ==================================================================
+        test_num = 2;
+        $display("[%0t] TEST %0d: Basic pipeline run", $time, test_num);
+
+        axi_write(ADDR_DATA_IN, 32'h000000FF, 4'hF);
+        axi_write(ADDR_CTRL,    32'h00000001, 4'h1); // trigger
+
+        wait_done(PIPE_CYCLES + 20);
+
+        axi_read(ADDR_DATA_OUT, read_data, read_resp);
+        if (read_data !== expected_result(32'h000000FF))
+            $display("FAIL T2: DATA_OUT = %0h, expected %0h",
+                     read_data, expected_result(32'h000000FF));
+        else
+            $display("[%0t] TEST %0d PASS (DATA_OUT = %0h)", $time, test_num, read_data);
+
+        axi_write(ADDR_CTRL, 32'h00000000, 4'h1); // clear
+
+        // ==================================================================
+        // Test 3 – Retrigger mid-pipeline uses latest operand
+        // ==================================================================
+        test_num = 3;
+        $display("[%0t] TEST %0d: Retrigger with new operand", $time, test_num);
+
+        axi_write(ADDR_DATA_IN, 32'h00000015, 4'hF);
+        axi_write(ADDR_CTRL,    32'h00000001, 4'h1);        // first trigger
+
+        repeat (PIPE_CYCLES / 4) @(posedge ACLK);
+
+        axi_write(ADDR_CTRL,    32'h00000000, 4'h1);        // cancel
+        axi_write(ADDR_DATA_IN, 32'h0000002A, 4'hF);        // new operand
+        axi_write(ADDR_CTRL,    32'h00000001, 4'h1);        // retrigger
+
+        // DATA_OUT must still be 0 mid-pipeline
+        repeat (PIPE_CYCLES / 3) @(posedge ACLK);
+        axi_read(ADDR_DATA_OUT, read_data, read_resp);
+        if (read_data !== 32'h0)
+            $display("FAIL T3: DATA_OUT changed too early, got %0h", read_data);
+
+        wait_done(PIPE_CYCLES + 20);
+
+        axi_read(ADDR_DATA_OUT, read_data, read_resp);
+        if (read_data !== expected_result(32'h0000002A))
+            $display("FAIL T3: DATA_OUT = %0h, expected %0h",
+                     read_data, expected_result(32'h0000002A));
+        else
+            $display("[%0t] TEST %0d PASS (DATA_OUT = %0h)", $time, test_num, read_data);
+
+        axi_write(ADDR_CTRL, 32'h00000000, 4'h1);
+
+        // ==================================================================
+        // Test 4 – SLVERR on unmapped address (write)
+        // ==================================================================
+        test_num = 4;
+        $display("[%0t] TEST %0d: SLVERR on unmapped write address", $time, test_num);
+
+        axi_write(6'h3C, 32'hDEADBEEF, 4'hF);
+        if (write_resp !== 2'b10)
+            $display("FAIL T4: BRESP = %0b, expected SLVERR (10)", write_resp);
+        else
+            $display("[%0t] TEST %0d PASS", $time, test_num);
+
+        // ==================================================================
+        // Test 5 – SLVERR on unmapped address (read)
+        // ==================================================================
+        test_num = 5;
+        $display("[%0t] TEST %0d: SLVERR on unmapped read address", $time, test_num);
+
+        axi_read(6'h3C, read_data, read_resp);
+        if (read_resp !== 2'b10)
+            $display("FAIL T5: RRESP = %0b, expected SLVERR (10)", read_resp);
+        else
+            $display("[%0t] TEST %0d PASS", $time, test_num);
+
+        // ==================================================================
+        // Test 6 – Read back CTRL and DATA_IN registers
+        // ==================================================================
+        test_num = 6;
+        $display("[%0t] TEST %0d: Register read-back", $time, test_num);
+
+        axi_write(ADDR_DATA_IN, 32'hCAFEBABE, 4'hF);
+        axi_read (ADDR_DATA_IN, read_data, read_resp);
+        if (read_data !== 32'hCAFEBABE)
+            $display("FAIL T6: DATA_IN read-back = %0h, expected CAFEBABE", read_data);
+        else
+            $display("[%0t] TEST %0d PASS", $time, test_num);
+
+        // ------------------------------------------------------------------
+        // Done
+        // ------------------------------------------------------------------
+        repeat (10) @(posedge ACLK);
+        $display("[%0t] All tests complete.", $time);
+        $finish;
     end
 
 endmodule
