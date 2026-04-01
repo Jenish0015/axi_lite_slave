@@ -95,7 +95,7 @@ async def test_axi_lite_slave_hidden(dut):
     backpressure, WSTRB byte-mask edge cases, retrigger semantics, fixed
     pipeline latency enforcement, and reset mid-flight cancellation.
     """
-    clock = Clock(dut.ACLK, 10, units="ns")
+    clock = Clock(dut.ACLK, 10, unit="ns")
     clock.start(start_high=False)
     await reset_dut(dut)
 
