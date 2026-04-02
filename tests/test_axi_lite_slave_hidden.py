@@ -7,13 +7,12 @@ from cocotb.triggers import NextTimeStep, ReadOnly, RisingEdge
 
 
 def _resolved_rtl_sv(proj_path: Path) -> Path:
-    """Student stub in sources/; golden branch ships reference RTL under golden/."""
     g = proj_path / "golden" / "axi_lite_slave.sv"
     return g if g.is_file() else (proj_path / "sources" / "axi_lite_slave.sv")
 
 
 async def _after_readonly() -> None:
-    """Leave ReadOnly phase so DUT inputs may be driven (cocotb requirement)."""
+   
     await NextTimeStep()
 
 
