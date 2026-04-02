@@ -1,34 +1,36 @@
+`timescale 1ns / 1ps
 
-`timescale 1ns/1ps
+// Baseline branch: parameterized ports, empty body (agent implements all logic).
+module axi_lite_slave #(
+    parameter int unsigned DATA_WIDTH = 32,
+    parameter int unsigned ADDR_WIDTH = 32
+) (
+    input  wire                      ACLK,
+    input  wire                      ARESETn,
 
-module axi_lite_slave (
-    input  logic        ACLK,
-    input  logic        ARESETn,
+    input  wire [ADDR_WIDTH-1:0]     AWADDR,
+    input  wire                      AWVALID,
+    output reg                       AWREADY,
 
-    input  logic [31:0] AWADDR,
-    input  logic        AWVALID,
-    output logic        AWREADY,
+    input  wire [DATA_WIDTH-1:0]    WDATA,
+    input  wire [3:0]                WSTRB,
+    input  wire                      WVALID,
+    output reg                       WREADY,
 
-    input  logic [31:0] WDATA,
-    input  logic [3:0]  WSTRB,
-    input  logic        WVALID,
-    output logic        WREADY,
+    output reg [1:0]                 BRESP,
+    output reg                       BVALID,
+    input  wire                      BREADY,
 
-    output logic [1:0]  BRESP,
-    output logic        BVALID,
-    input  logic        BREADY,
+    input  wire [ADDR_WIDTH-1:0]     ARADDR,
+    input  wire                      ARVALID,
+    output reg                       ARREADY,
 
-    input  logic [31:0] ARADDR,
-    input  logic        ARVALID,
-    output logic        ARREADY,
-
-    output logic [31:0] RDATA,
-    output logic [1:0]  RRESP,
-    output logic        RVALID,
-    input  logic        RREADY
+    output reg [DATA_WIDTH-1:0]     RDATA,
+    output reg [1:0]                 RRESP,
+    output reg                       RVALID,
+    input  wire                      RREADY
 );
-    // Internal logic
 
-endmodule
+    // Empty body — fill in sources/axi_lite_slave.sv per the problem specification.
 
 endmodule
