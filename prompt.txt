@@ -58,7 +58,9 @@ Hidden cocotb tests read **CTRL** after reset (expect **0**); implement read-bac
 5. **BREADY=0**: hold **BVALID/BRESP** stable; keep **AWREADY=0** while a write response is pending (tested for 10 consecutive cycles, every cycle).
 6. Partial **WSTRB** on **DATA_IN** required for byte-wise merge.
 
-**Responses:** OKAY (`2'b00`) on all mapped accesses. Assign as constants: `assign BRESP = 2'b00; assign RRESP = 2'b00;`
+**Responses:** Drive **`BRESP`** and **`RRESP`** from decode logic **per transaction**—not a single global tie to OKAY. Use **OKAY (`2'b00`)** for **legal** mapped accesses (writes to **0x00**/**0x04**; reads to **0x00**–**0x0C** as defined in the map). Use **SLVERR (`2'b10`)** for **unmapped** addresses and for **writes** to read-only locations (**0x08** DATA_OUT, **0x0C** STATUS). Keep `BRESP`/`RRESP` stable while `BVALID`/`RVALID` is high and `BREADY`/`RREADY` is low.
+
+**Port driving (avoid simulation bugs):** Do **not** declare `BRESP`, `RRESP`, or `RDATA` as `output reg` **and** drive them with **`assign`** on the same signals—that is invalid in Verilog/SystemVerilog. Either use **`output wire`** / **`output logic`** with **`assign`**, or drive those ports only from **`always_ff`** / **`always_comb`**, consistently.
 
 ---
 
@@ -146,6 +148,8 @@ end
 assign RDATA = RVALID ? rdata_mux : 32'd0;
 ```
 
+If you use **`assign RDATA`**, declare **`RDATA`** as a **net**-style output (e.g. **`output wire [31:0] RDATA`**) so it matches continuous assignment. The cocotb tests sample on clock edges; you do **not** need arbitrary `#` delays in the RTL to “fix” read data.
+
 **Why this is correct and timing works:** `r_addr_latch <= ARADDR` and `RVALID <= 1` are both registered on the same clock edge. On the very next clock edge, `r_addr_latch` holds the correct address and `RVALID` is high. The combinational mux instantly produces the right data. There is no timing problem.
 
 **Do NOT try to use `ARADDR` directly in the mux** to "fix" a perceived latency issue. Agents commonly add `(state == RST_IDLE && ARVALID) ? ARADDR[5:0] : r_addr_latch[5:0]` as the mux select. This breaks under backpressure: once ARVALID is deasserted but RREADY is still 0, ARADDR may change to a different address and corrupt RDATA mid-hold.
@@ -178,7 +182,8 @@ end
 ```
 
 <HINTS>
-**Decode error responses:** Drive `BRESP` and `RRESP` per transaction (not a single global tie-off to OKAY). Use **OKAY (`2'b00`)** only for legal mapped accesses. Use **SLVERR (`2'b10`)** for unmapped addresses (outside the registers decoded by `addr[5:0]`) and for **writes** to read-only locations (**0x08** DATA_OUT, **0x0C** STATUS). Keep `BRESP`/`RRESP` stable with `BVALID`/`RVALID` while `BREADY`/`RREADY` is low.
+- **Decode error responses:** Drive `BRESP` and `RRESP` per transaction (not a single global tie-off to OKAY). Use **OKAY (`2'b00`)** only for legal mapped accesses. Use **SLVERR (`2'b10`)** for unmapped addresses (outside the registers decoded by `addr[5:0]`) and for **writes** to read-only locations (**0x08** DATA_OUT, **0x0C** STATUS). Keep `BRESP`/`RRESP` stable with `BVALID`/`RVALID` while `BREADY`/`RREADY` is low.
+- **Do not mix `output reg` with `assign`** on `BRESP`, `RRESP`, or `RDATA`; pick procedural **or** continuous assignment, not both.
 - Implement writes with a 3-state FSM: capture AW in WST_IDLE→WST_AW, accept W in WST_AW→WST_RESP, hold BVALID until BREADY in WST_RESP. All outputs are registered. Gate AWREADY on pending B.
 - For reads, keep RVALID/RDATA/RRESP stable while RREADY is low; do not accept a new AR until the current read response completes.
 - On writes, merge WDATA per WSTRB for CTRL and DATA_IN; unstrobed bytes keep prior register values.
@@ -190,4 +195,3 @@ end
 - The write-datapath block and the pipeline-decrement block must be mutually exclusive using `if...else if`.
 - RDATA: use `assign RDATA = RVALID ? rdata_mux : 32'd0;` where `rdata_mux` is a combinational mux on `r_addr_latch[5:0]`. This is correct because `r_addr_latch` and `RVALID` are latched together on the same clock edge.
 </HINTS>
-
