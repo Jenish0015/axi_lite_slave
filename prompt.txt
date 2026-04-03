@@ -177,41 +177,8 @@ end else begin
 end
 ```
 
----
-
-## How to run the RTL model (cocotb)
-
-- **Python** ≥ 3.11; install project deps (e.g. `pip install -e .` or install `cocotb` and `pytest` per `pyproject.toml`).
-- **Simulator:** default `SIM=icarus` (Icarus Verilog).
-- **Command:** `pytest tests/test_axi_lite_slave_hidden.py::test_axi_lite_slave_hidden_runner -q`
-
----
-
-## Common pitfalls — ranked by frequency
-
-1. **Module has parameters** — immediate cocotb compile failure. Write a flat module.
-
-2. **AWREADY raised while B response pending** — the hidden test checks this for 10 consecutive cycles. Use the 3-state FSM with `AWREADY <= (!BVALID) || BREADY` in WST_IDLE and `AWREADY <= 0` in WST_RESP.
-
-3. **Combinational FSM outputs (always_comb)** — drive all channel outputs (`AWREADY`, `WREADY`, `BVALID`, `ARREADY`, `RVALID`) from `always_ff`, not `always_comb`. Combinational outputs glitch and can violate AXI hold rules.
-
-4. **Register writes in WST_RESP / multi-cycle write firing** — apply all writes (CTRL, DATA_IN, pipeline start/clear) exactly once, on the cycle `(w_state == WST_AW && WVALID && WREADY)` is true. Never in WST_RESP.
-
-5. **RDATA decoded from `ARADDR` instead of `r_addr_latch`** — use `r_addr_latch` with `assign RDATA = RVALID ? rdata_mux : 0`. The latch is valid on the same cycle RVALID goes high.
-
-6. **Pipeline counter checked at `== 0` instead of `== 1`** — gives 33 cycles. Check `== 1`.
-
-7. **Write and pipeline blocks not mutually exclusive** — use `if...else if` so a pipeline start and a pipeline tick don't happen in the same cycle.
-
-8. **33-bit addition intermediate** — use `wire [31:0]` for the result; the add wraps automatically.
-
-9. **pipe_stall missing `(BVALID & ~BREADY)` term** — counter runs during write-backpressure, DATA_OUT appears one or more cycles too early.
-
-10. **Masked CTRL (WSTRB[0]=0) must not start or clear** — always guard under `if (WSTRB[0])`.
-
-11. **Reset does not clear pipe_busy / data_out_reg / status_reg** — post-reset reads of DATA_OUT and STATUS must return 0.
-
 <HINTS>
+**Decode error responses:** Drive `BRESP` and `RRESP` per transaction (not a single global tie-off to OKAY). Use **OKAY (`2'b00`)** only for legal mapped accesses. Use **SLVERR (`2'b10`)** for unmapped addresses (outside the registers decoded by `addr[5:0]`) and for **writes** to read-only locations (**0x08** DATA_OUT, **0x0C** STATUS). Keep `BRESP`/`RRESP` stable with `BVALID`/`RVALID` while `BREADY`/`RREADY` is low.
 - Implement writes with a 3-state FSM: capture AW in WST_IDLE→WST_AW, accept W in WST_AW→WST_RESP, hold BVALID until BREADY in WST_RESP. All outputs are registered. Gate AWREADY on pending B.
 - For reads, keep RVALID/RDATA/RRESP stable while RREADY is low; do not accept a new AR until the current read response completes.
 - On writes, merge WDATA per WSTRB for CTRL and DATA_IN; unstrobed bytes keep prior register values.
@@ -223,3 +190,5 @@ end
 - The write-datapath block and the pipeline-decrement block must be mutually exclusive using `if...else if`.
 - RDATA: use `assign RDATA = RVALID ? rdata_mux : 32'd0;` where `rdata_mux` is a combinational mux on `r_addr_latch[5:0]`. This is correct because `r_addr_latch` and `RVALID` are latched together on the same clock edge.
 </HINTS>
+
+
