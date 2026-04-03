@@ -7,12 +7,22 @@ from cocotb.triggers import NextTimeStep, ReadOnly, RisingEdge
 
 
 def _resolved_rtl_sv(proj_path: Path) -> Path:
+    """Golden branch may ship RTL under golden/; baseline implements DUT in axi_lite_slave_dut.sv.
+
+    The pytest/cocotb runner must compile the DUT file agents edit — not axi_lite_slave.sv
+    (that file is an optional local TB / empty stub on baseline).
+    """
     g = proj_path / "golden" / "axi_lite_slave.sv"
-    return g if g.is_file() else (proj_path / "sources" / "axi_lite_slave.sv")
+    if g.is_file():
+        return g
+    dut = proj_path / "sources" / "axi_lite_slave_dut.sv"
+    if dut.is_file():
+        return dut
+    return proj_path / "sources" / "axi_lite_slave.sv"
 
 
 async def _after_readonly() -> None:
-   
+    """Leave ReadOnly phase so DUT inputs may be driven (cocotb requirement)."""
     await NextTimeStep()
 
 
