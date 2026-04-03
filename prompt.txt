@@ -1,92 +1,98 @@
- Implement the complete RTL in **`sources/axi_lite_slave.sv`**.
+Implement the AXI4-Lite slave as **`module axi_lite_slave`**. That file is what the automated cocotb build uses (`hdl_toplevel="axi_lite_slave"`).
 
-Implement the AXI-Lite slave module in sources/axi_lite_slave.sv from scratch.
-The module ports are already defined. You must fill in the complete RTL implementation.
+**Note:** `sources/axi_lite_slave.sv` in this repository is a **separate SystemVerilog testbench** (`axi_lite_slave_tb`) for local bring-up; it is **not** the DUT file the pytest/cocotb runner compiles. Do not assume the DUT ports live there.
 
-## Register Map
-| Address | Name     | Access | Description            |
-|---------|----------|--------|------------------------|
-| 0x00    | ctrl_reg | R/W    | bit[0] = start trigger |
-| 0x04    | data_in  | R/W    | input data register    |
-| 0x08    | data_out | RO     | computed result        |
-| 0x0C    | status   | RO     | bit[0] = done flag     |
-Reads to CTRL/DATA_IN are not required by the hidden suite; you may return 0 or a read-back of latched registers—be consistent with your write behavior.
+**Ports (must match):** `ACLK`, `ARESETn` (active-low async reset); full AXI4-Lite write (`AWADDR[31:0]`, `AWVALID`, `AWREADY`, `WDATA`, `WSTRB`, `WVALID`, `WREADY`, `BRESP`, `BVALID`, `BREADY`) and read (`ARADDR[31:0]`, `ARVALID`, `ARREADY`, `RDATA`, `RRESP`, `RVALID`, `RREADY`). Decode registers using **`addr[5:0]`** (aligned 32-bit addresses 0x00, 0x04, 0x08, 0x0C).
+
+---
+
+## Register map
+
+| Address | Name      | Access | Description |
+|---------|-----------|--------|-------------|
+| 0x00    | CTRL      | Write (per-byte WSTRB) | **Byte 0:** if `WSTRB[0]=1` and `WDATA[0]=1`, **start** pipeline from current **DATA_IN**; if `WSTRB[0]=1` and `WDATA[0]=0`, **clear** pipeline. If `WSTRB[0]=0`, **no** start/clear (masked write). Other bytes: update CTRL storage per strobes if you implement read-back. |
+| 0x04    | DATA_IN   | Write (per-byte WSTRB) | Merge `WDATA` into `DATA_IN` only on strobed bytes; others keep previous value. |
+| 0x08    | DATA_OUT  | Read | While pipeline **busy**, return **0**. After run completes, return the **pipelined** result (see below). |
+| 0x0C    | STATUS    | Read | **0** when idle/busy without completion bit set; **bit 0 = 1** when a run has **finished** (golden behavior). |
+
+Hidden cocotb tests read **CTRL** after reset (expect **0**); implement read-back consistently if you expose CTRL on reads.
 
 ---
 
 ## Pipeline and arithmetic
 
-- **`PIPE_CYCLES`**: **32** clock cycles from **start** until the result is written to DATA_OUT and STATUS indicates done.
-- **Operand capture**: When the pipeline **starts** (CTRL byte0 strobe with `WDATA[0]=1`), latch the operand from the **current DATA_IN** register (the value **after** any same-beat merge logic you use for that write transaction).
-- **Result function** (32-bit; matches reference tests):
+- **`PIPE_CYCLES` = 32**: From **start** until **DATA_OUT** and **STATUS** reflect completion, **32 enabled clock edges** must elapse (see backpressure: cycles where the slave stalls on **R** or **B** must **not** count down).
+- **Operand**: When a start is recognized, latch from the current **DATA_IN** register (post-merge).
+- **Result** (32-bit wrap on XOR/add, then shift):
 
   `result = (((operand ^ 32'hA5A5A5A5) + operand) >> 2`
 
-  Use unsigned/wrapping 32-bit XOR and add; then shift right by 2.
-
-- **While `pipe_busy`**: Do **not** expose a non-zero result on DATA_OUT reads; the hidden test checks **early** reads return **0**.
-- **Pipeline timebase**: The 32-cycle counter must **not** advance in cycles where the slave is **stalled** on the response channels (see backpressure). Typical pattern: stall when `(RVALID && !RREADY) || (BVALID && !BREADY)`.
+- **While busy**: **DATA_OUT** reads must be **0** (early-read checks).
+- **Stall**: Typical `pipe_stall = (RVALID & ~RREADY) | (BVALID & ~BREADY)`; do not advance the pipeline counter while stalled.
 
 ---
 
-## CTRL / retrigger / reset semantics
+## CTRL / reset
 
-- **Clear** (write CTRL with `WSTRB[0]=1` and `WDATA[0]=0`): stops the pipeline and clears busy state as appropriate for your FSM.
-- **New run after clear**: After clear, software may write a new **DATA_IN**, then **trigger** again; the final result must use the **latest** operand for that run.
-- **Asynchronous reset `ARESETn`**: When asserted low, cancel any in-flight pipeline, clear **DATA_OUT** / **STATUS** / **CTRL** visibility to an idle state such that after reset, DATA_OUT and STATUS read as **0** and no stale “done” state remains. The hidden test **resets mid-flight** and later checks that pending results did **not** complete.
+- **Clear** stops the pipeline and clears busy/done behavior per your FSM (golden clears STATUS on trigger and sets done at end).
+- **ARESETn** low: cancel in-flight work; after release, **DATA_OUT**, **STATUS**, and **CTRL** read as **0** where tested; no stale completion from before reset.
 
 ---
 
-## AXI4-Lite protocol (strict)
+## AXI4-Lite (strict)
 
-1. **AW** and **W** are decoupled**: either order; do not assume AW before W.
+1. **AW** and **W** decoupled** (either order).
 2. **BVALID** only after **both** AW and W handshakes for that transaction.
-3. **RVALID** only after the AR handshake for that read; **RDATA** and **RRESP** must remain **stable** while **RVALID** is high until **RREADY** completes the transfer.
-4. **Read hold**: If the master keeps **RREADY=0**, **RVALID** must stay asserted and **RDATA/RRESP** must not change until the handshake—**multiple cycles** of hold are tested.
-5. **Write response hold**: If **BREADY=0**, **BVALID** stays high and **BRESP** stable; and **AWREADY** must stay **low** while a write response is pending (the hidden test asserts this ordering).
-6. **WSTRB** on DATA_IN: support **partial** writes (e.g. only upper bytes) so the operand can be built from multiple writes before a trigger.
+3. **RVALID** after AR handshake; **RDATA/RRESP** stable until **RREADY** completes.
+4. **RREADY=0**: hold **RVALID** and data/resp for multiple cycles.
+5. **BREADY=0**: hold **BVALID/BRESP**; keep **AWREADY=0** while a write response is pending (tested).
+6. Partial **WSTRB** on **DATA_IN** required for byte-wise merge.
+
+**Responses:** Hidden tests expect **OKAY** (`2'b00`) on successful mapped accesses. SLVERR on unmapped or illegal writes is **not** asserted by the hidden suite (your local TB may add it).
 
 ---
 
-## Common pitfalls (hidden tests exercise these)
+## Reference FSM shape (golden-style)
 
-- Masked **CTRL** write with **`WSTRB[0]=0`** must **not** start or clear the pipeline.
-- **Backpressure** on R or B must **freeze** the pipeline counter (not “lose” cycles).
-- **Merged DATA_IN** via partial **WSTRB** must match **byte-wise** updates before the trigger used in the final check.
+- **Write:** small FSM—capture **AW**, then accept **W**, then assert **BVALID** until **BREADY**. Only apply register writes on the **W** handshake using the latched address. **AWREADY** must respect pending **B**.
+- **Read:** after **AR**, assert **RVALID** and hold until **RREADY**; **ARREADY** low while a read response is pending.
 
+---
 
-## AXI-Lite Write FSM (3 states: W_IDLE, W_DATA, W_RESP)
-- W_IDLE: assert AWREADY=1, wait for AWVALID, latch address, go to W_DATA
-- W_DATA: assert WREADY=1, wait for WVALID, write data to register, assert BVALID=1, go to W_RESP
-- W_RESP: wait for BREADY=1, deassert BVALID, return to W_IDLE
+## Datapath (must match timing, not combinational)
 
-## AXI-Lite Read FSM
-- When ARVALID=1 and RVALID=0: latch address, assert ARREADY=1 and RVALID=1, output RDATA from register map
-- When RREADY=1: deassert RVALID and ARREADY
+- Do **not** update **DATA_OUT** with the final result on the same cycle as the CTRL start. Commit **DATA_OUT** (and set **STATUS** done) only after the **fixed delay** (32 non-stalled cycles) from start.
+- **STATUS[0]** should reflect **done** after that delay; clearing via CTRL (byte0 strobe with 0) should align with golden expectations.
 
-## Datapath
-- When ctrl_reg[0]=1: compute and store:
-  data_out_reg = (((data_in_reg ^ 32'hA5A5A5A5) + data_in_reg) & 32'hFFFFFFFF) >> 2
-- Set status_reg[0]=1 after computation
-- Clear status_reg[0]=0 when ctrl_reg[0] is written to 0
+---
 
-## Reset (ARESETn=0 active low)
-- All internal registers reset to 0
-- All AXI outputs reset to 0
-- FSM returns to W_IDLE
+## How to run the RTL model (cocotb)
+
+- **Python** ≥ 3.11; install project deps (e.g. from repo root: `pip install -e .` or install `cocotb` and `pytest` per `pyproject.toml`).
+- **Simulator:** default **`SIM=icarus`** (Icarus Verilog, `iverilog` / `vvp` on `PATH`). Other simulators work if cocotb supports them and you set **`SIM`** accordingly.
+- **Command:** `pytest tests/test_axi_lite_slave_hidden.py::test_axi_lite_slave_hidden_runner -q`
+
+`pyproject.toml` references **`README.md`**, which may be absent in a minimal checkout; use the command above and `pyproject.toml` for dependencies.
+
+---
+
+## Common pitfalls (hidden tests)
+
+- Masked **CTRL** with **`WSTRB[0]=0`** must not start or clear the pipeline.
+- Backpressure must **freeze** the pipeline counter.
+- **DATA_IN** built from multiple partial writes must match **byte-wise** merge before trigger.
+- **Reset** mid-flight must cancel pending results.
 
 <HINTS>
-- Implement AXI writes with a simple 3-state FSM: capture AW first, then accept W, then hold BVALID until BREADY.
-- For reads, keep RVALID/RDATA stable while RREADY is low, and only accept a new AR when no read response is pending.
-- Only CTRL (0x00) and DATA_IN (0x04) are writable; writes to DATA_OUT/STATUS or unmapped addresses should return SLVERR.
-- Treat CTRL[0] as a level with edge detection: start a new run only on a 0→1 transition; while CTRL[0] stays 1, further writes of 1 must not restart. Clearing CTRL[0] (when byte0 is strobed) should clear the done flag.
-- When a trigger edge is recognized, latch the operand from the current DATA_IN register (after any WSTRB merge for that register)—do not sample a free-running bus—and delay committing DATA_OUT/STATUS until the full fixed-cycle pipeline finishes.
-- On writes, merge WDATA into each target register only on bytes where WSTRB is 1; other byte lanes of that register retain their previous values (for both CTRL and DATA_IN).
-- Asserting ARESETn low should clear user-visible registers and cancel any in-progress pipeline so DATA_OUT/STATUS do not reflect a pre-reset run after release.
-- While a write response (BVALID) is pending, keep AWREADY low until B completes; while a read response (RVALID) is pending, keep ARREADY low until R completes.
-- AW and W are independent: the master may assert W before AW or AW before W. Buffer both the latched address and the latched WDATA/WSTRB, and only emit B after both handshakes for that transaction—do not assume AW always arrives first.
-- If a new CTRL start (0→1 on byte0) occurs while an earlier run is still in progress, the spec expects the new run to take over: refresh the latched operand and restart the fixed-cycle countdown so the final DATA_OUT reflects the latest operand, rather than ignoring the trigger because the pipeline is already busy.
+- Implement writes with a 3-state FSM: capture AW, accept W, hold BVALID until BREADY; gate AWREADY while B is pending.
+- For reads, keep RVALID/RDATA/RRESP stable while RREADY is low; do not accept a new AR until the current read response completes.
+- On writes, merge WDATA per WSTRB for **CTRL** and **DATA_IN**; unstrobed bytes keep prior register values.
+- **CTRL byte0:** each accepted write that strobes byte0 with `WDATA[0]=1` **starts** the pipeline (re-latching **DATA_IN** into the operand and reloading the 32-cycle timer per golden behavior); strobing byte0 with `WDATA[0]=0` **clears** busy/timer as in the reference.
+- While **BVALID** is high and **BREADY** is low, keep **AWREADY** low; while **RVALID** is high and **RREADY** is low, keep **ARREADY** low.
+- **AW** and **W** are independent: buffer latched address and (WDATA, WSTRB) until both handshakes complete, then emit **B**.
+- **ARESETn** must clear user-visible state and cancel any in-progress pipeline.
 </HINTS>
+
 
 
 
