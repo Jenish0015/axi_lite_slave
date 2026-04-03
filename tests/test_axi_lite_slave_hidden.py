@@ -2,16 +2,19 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import cocotb
+from cocotb.clock import Clock
+from cocotb.triggers import RisingEdge
 
 
 def _resolved_rtl_sv(proj_path: Path) -> Path:
-    """Compile student DUT (axi_lite_slave_dut.sv) when present; else sources/axi_lite_slave.sv."""
+    """Prefer `sources/axi_lite_slave_dut.sv` (baseline ships it); else golden/; else stub."""
     dut = proj_path / "sources" / "axi_lite_slave_dut.sv"
     if dut.is_file():
         return dut
+    g = proj_path / "golden" / "axi_lite_slave.sv"
+    if g.is_file():
+        return g
     return proj_path / "sources" / "axi_lite_slave.sv"
-from cocotb.clock import Clock
-from cocotb.triggers import RisingEdge
 
 
 async def axi_write(dut, addr, data, wstrb=0xF):
