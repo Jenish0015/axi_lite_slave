@@ -1,16 +1,10 @@
-# axi_lite_slave task prompt
-# Spec body: keep aligned with `src/hud_controller/problems/basic.py` (ProblemSpec id=axi_lite_slave).
-# The `<HINTS>` block below is **upstream-only** (not in basic.py); publish it for GitHub/agent use.
-# HUD/MCP uses `spec_to_statement` (no hints unless re-added to ProblemSpec).
-# Hints are curated from agent failure analysis (Icarus TB, write FSM oscillation, B/R handshake, retrigger, ARREADY sampling).
-
-Implement the complete RTL in **`sources/axi_lite_slave_dut.sv`**.
-
-Implement the AXI4-Lite slave as **`module axi_lite_slave`**. That file is what the automated cocotb build uses (`hdl_toplevel="axi_lite_slave"`).
+Implement the AXI4-Lite slave as **`module axi_lite_slave`** in **`sources/axi_lite_slave_dut.sv`**. That file is what the automated cocotb build uses (`hdl_toplevel="axi_lite_slave"`).
 
 **Note:** `sources/axi_lite_slave.sv` in this repository is a **separate SystemVerilog testbench** (`axi_lite_slave_tb`) for local bring-up; it is **not** the DUT file the pytest/cocotb runner compiles. Do not assume the DUT ports live there.
 
-**Ports (must match):** `ACLK`, `ARESETn` (active-low async reset); full AXI4-Lite write (`AWADDR[31:0]`, `AWVALID`, `AWREADY`, `WDATA`, `WSTRB`, `WVALID`, `WREADY`, `BRESP`, `BVALID`, `BREADY`) and read (`ARADDR[31:0]`, `ARVALID`, `ARREADY`, `RDATA`, `RRESP`, `RVALID`, `RREADY`). Decode registers using **`addr[5:0]`** (aligned 32-bit addresses 0x00, 0x04, 0x08, 0x0C).
+**CRITICAL — No module parameters.** The baseline file has `parameter DATA_WIDTH` and `ADDR_WIDTH`. Do NOT copy those into your DUT. Write a flat module with no parameters. The cocotb runner instantiates `axi_lite_slave` with no parameters and will fail to elaborate if your module has them.
+
+**Ports (must match exactly):** `ACLK`, `ARESETn` (active-low async reset); full AXI4-Lite write (`AWADDR[31:0]`, `AWVALID`, `AWREADY`, `WDATA[31:0]`, `WSTRB[3:0]`, `WVALID`, `WREADY`, `BRESP[1:0]`, `BVALID`, `BREADY`) and read (`ARADDR[31:0]`, `ARVALID`, `ARREADY`, `RDATA[31:0]`, `RRESP[1:0]`, `RVALID`, `RREADY`). Decode registers using **`addr[5:0]`** (aligned 32-bit addresses 0x00, 0x04, 0x08, 0x0C).
 
 ---
 
@@ -29,64 +23,203 @@ Hidden cocotb tests read **CTRL** after reset (expect **0**); implement read-bac
 
 ## Pipeline and arithmetic
 
-- **`PIPE_CYCLES` = 32**: From **start** until **DATA_OUT** and **STATUS** reflect completion, **32 enabled clock edges** must elapse (see backpressure: cycles where the slave stalls on **R** or **B** must **not** count down).
-- **Operand**: When a start is recognized, latch from the current **DATA_IN** register (post-merge).
-- **Result** (32-bit wrap on XOR/add, then shift):
+- **`PIPE_CYCLES` = 32**: From **start** until **DATA_OUT** and **STATUS** reflect completion, exactly **32 enabled clock edges** must elapse. Load the counter at **32** and count down; complete when the counter equals **1** (commit result that same cycle, counter goes to 0). Do NOT use `== 0` as the completion check — that fires one cycle too late and gives 33 cycles.
+- **Operand**: When a start is recognized (W handshake on CTRL with `WSTRB[0]=1` and `WDATA[0]=1`), latch the current value of `data_in_reg` as the operand.
+- **Result** — 32-bit unsigned wrap on the addition, then shift:
 
-  `result = (((operand ^ 32'hA5A5A5A5) + operand) >> 2`
+  ```systemverilog
+  wire [31:0] result = (((operand ^ 32'hA5A5A5A5) + operand)) >> 2;
+  ```
 
-- **While busy**: **DATA_OUT** reads must be **0** (early-read checks).
-- **Stall**: Typical `pipe_stall = (RVALID & ~RREADY) | (BVALID & ~BREADY)`; do not advance the pipeline counter while stalled.
+  Declare the intermediate as `[31:0]` so the addition wraps at 32 bits. Do NOT use a wider type — that silently prevents overflow wrap and gives wrong answers.
+
+- **While busy**: DATA_OUT reads must return **0**.
+- **Stall**: Do NOT count down the pipeline counter when stalled:
+  ```systemverilog
+  wire pipe_stall = (RVALID & ~RREADY) | (BVALID & ~BREADY);
+  ```
+  Both terms are required. Missing `(BVALID & ~BREADY)` causes the counter to run during write-backpressure tests and DATA_OUT appears too early.
 
 ---
 
 ## CTRL / reset
 
-- **Clear** stops the pipeline and clears busy/done behavior per your FSM (golden clears STATUS on trigger and sets done at end).
-- **ARESETn** low: cancel in-flight work; after release, **DATA_OUT**, **STATUS**, and **CTRL** read as **0** where tested; no stale completion from before reset.
+- **Clear** stops the pipeline and clears busy/done. The golden clears `status_reg` when a start fires and sets it when the run finishes.
+- **ARESETn** low: cancel in-flight work; after release, DATA_OUT, STATUS, and CTRL read as **0**.
 
 ---
 
-## AXI4-Lite (strict)
+## AXI4-Lite — strict requirements
 
-1. **AW** and **W** decoupled (either order).
+1. **AW** and **W** are decoupled (either order).
 2. **BVALID** only after **both** AW and W handshakes for that transaction.
 3. **RVALID** after AR handshake; **RDATA/RRESP** stable until **RREADY** completes.
-4. **RREADY=0**: hold **RVALID** and data/resp for multiple cycles.
-5. **BREADY=0**: hold **BVALID/BRESP**; keep **AWREADY=0** while a write response is pending (tested).
+4. **RREADY=0**: hold **RVALID** and data/resp for multiple cycles (tested for 10 cycles).
+5. **BREADY=0**: hold **BVALID/BRESP** stable; keep **AWREADY=0** while a write response is pending (tested for 10 consecutive cycles, every cycle).
 6. Partial **WSTRB** on **DATA_IN** required for byte-wise merge.
 
-**Responses:** Hidden tests expect **OKAY** (`2'b00`) on successful mapped accesses. SLVERR on unmapped or illegal writes is **not** asserted by the hidden suite (your local TB may add it).
+**Responses:** OKAY (`2'b00`) on all mapped accesses. Assign as constants: `assign BRESP = 2'b00; assign RRESP = 2'b00;`
 
 ---
 
-## Reference FSM shape (golden-style)
+## Write FSM — use exactly this 3-state registered shape
 
-- **Write:** small FSM—capture **AW**, then accept **W**, then assert **BVALID** until **BREADY**. Only apply register writes on the **W** handshake using the latched address. **AWREADY** must respect pending **B**.
-- **Read:** after **AR**, assert **RVALID** and hold until **RREADY**; **ARREADY** low while a read response is pending.
+Use states `WST_IDLE`, `WST_AW`, `WST_RESP`. All outputs (`AWREADY`, `WREADY`, `BVALID`) are **registered** in `always_ff`, not driven from `always_comb`.
+
+```
+WST_IDLE:
+  AWREADY <= (!BVALID) || BREADY;   // gate: 0 while B response is pending
+  WREADY  <= 0;
+  if (AWVALID && AWREADY):          // handshake
+    w_addr_latch <= AWADDR;
+    AWREADY <= 0;
+    WREADY  <= 1;
+    goto WST_AW;
+
+WST_AW:
+  AWREADY <= 0;
+  WREADY  <= 1;
+  if (WVALID && WREADY):            // handshake — apply register writes HERE
+    WREADY  <= 0;
+    BVALID  <= 1;
+    goto WST_RESP;
+
+WST_RESP:
+  AWREADY <= 0;                     // always 0 while B is pending
+  WREADY  <= 0;
+  if (BVALID && BREADY):
+    BVALID  <= 0;
+    goto WST_IDLE;
+```
+
+**Do NOT use a 4-state FSM** (IDLE/ADDR/DATA/RESP). The 4-state shape is tempting because it handles W-before-AW, but it makes AWREADY gating much harder to get right, and the hidden test always sends AW before W anyway. The 3-state shape is simpler and handles both orderings correctly because it stays in WST_AW waiting for W after AW is accepted.
+
+**AWREADY gating is the most frequently failed hidden check.** The test holds `BREADY=0` for 10 cycles while `BVALID=1` and asserts `AWREADY == 0` every single cycle. This works automatically with the 3-state FSM: WST_RESP always forces `AWREADY <= 0`, and WST_IDLE computes `(!BVALID) || BREADY` which is 0 when BVALID is still asserted.
+
+**Register writes go in WST_AW on the W handshake cycle only.** Do not put any register write logic inside WST_RESP or in a separate `always_ff` block that fires based on a combinational `do_write` wire while the FSM stays in WST_RESP. Doing so re-triggers the write every cycle until BREADY arrives, which re-starts the pipeline repeatedly.
+
+**Mutual exclusion with pipeline:** Use an `if...else if` structure so the W handshake branch and the pipeline decrement branch cannot fire in the same cycle:
+
+```systemverilog
+if (w_state == WST_AW && WVALID && WREADY) begin
+    // apply register writes (CTRL, DATA_IN, pipeline start/clear)
+end else if (pipe_busy && !pipe_stall) begin
+    // decrement pipeline counter
+end
+```
 
 ---
 
-## Datapath (must match timing, not combinational)
+## Read FSM — use exactly this 2-state registered shape
 
-- Do **not** update **DATA_OUT** with the final result on the same cycle as the CTRL start. Commit **DATA_OUT** (and set **STATUS** done) only after the **fixed delay** (32 non-stalled cycles) from start.
-- **STATUS[0]** should reflect **done** after that delay; clearing via CTRL (byte0 strobe with 0) should align with golden expectations.
+Use states `RST_IDLE`, `RST_DATA`. All outputs are **registered** in `always_ff`.
+
+```
+RST_IDLE:
+  ARREADY <= 1;
+  if (ARVALID && ARREADY):
+    r_addr_latch <= ARADDR;     // latch address on this same clock edge
+    ARREADY <= 0;
+    RVALID  <= 1;
+    goto RST_DATA;
+
+RST_DATA:
+  ARREADY <= 0;
+  if (RVALID && RREADY):
+    RVALID  <= 0;
+    goto RST_IDLE;
+```
+
+**RDATA must be driven from `r_addr_latch`, not from `ARADDR` directly.** The correct pattern is:
+
+```systemverilog
+logic [31:0] rdata_mux;
+always_comb begin
+    case (r_addr_latch[5:0])
+        6'h00: rdata_mux = ctrl_reg;
+        6'h04: rdata_mux = data_in_reg;
+        6'h08: rdata_mux = pipe_busy ? 32'd0 : data_out_reg;
+        6'h0C: rdata_mux = status_reg;
+        default: rdata_mux = 32'd0;
+    endcase
+end
+assign RDATA = RVALID ? rdata_mux : 32'd0;
+```
+
+**Why this is correct and timing works:** `r_addr_latch <= ARADDR` and `RVALID <= 1` are both registered on the same clock edge. On the very next clock edge, `r_addr_latch` holds the correct address and `RVALID` is high. The combinational mux instantly produces the right data. There is no timing problem.
+
+**Do NOT try to use `ARADDR` directly in the mux** to "fix" a perceived latency issue. Agents commonly add `(state == RST_IDLE && ARVALID) ? ARADDR[5:0] : r_addr_latch[5:0]` as the mux select. This breaks under backpressure: once ARVALID is deasserted but RREADY is still 0, ARADDR may change to a different address and corrupt RDATA mid-hold.
+
+**Do NOT gate RDATA on `read_state == RST_DATA`** in the mux. Just gate on `RVALID`. It is equivalent and simpler.
+
+---
+
+## Datapath timing
+
+- Do NOT update DATA_OUT on the same cycle as the CTRL start. Commit DATA_OUT and set STATUS done only after 32 non-stalled cycles.
+- Counter detail (count-down from 32, complete at 1):
+
+```systemverilog
+// On start:
+operand_reg <= data_in_reg;
+pipe_ctr    <= PIPE_CYCLES;   // = 32 (declare as logic [31:0])
+pipe_busy   <= 1'b1;
+status_reg  <= '0;            // clear done bit
+
+// Each non-stalled cycle while busy:
+if (pipe_ctr == 32'd1) begin
+    data_out_reg <= (((operand_reg ^ 32'hA5A5A5A5) + operand_reg)) >> 2;
+    pipe_busy    <= 1'b0;
+    pipe_ctr     <= 32'd0;
+    status_reg   <= 32'h1;
+end else begin
+    pipe_ctr <= pipe_ctr - 32'd1;
+end
+```
+
+---
+
+## How to run the RTL model (cocotb)
+
+- **Python** ≥ 3.11; install project deps (e.g. `pip install -e .` or install `cocotb` and `pytest` per `pyproject.toml`).
+- **Simulator:** default `SIM=icarus` (Icarus Verilog).
+- **Command:** `pytest tests/test_axi_lite_slave_hidden.py::test_axi_lite_slave_hidden_runner -q`
+
+---
+
+## Common pitfalls — ranked by frequency
+
+1. **Module has parameters** — immediate cocotb compile failure. Write a flat module.
+
+2. **AWREADY raised while B response pending** — the hidden test checks this for 10 consecutive cycles. Use the 3-state FSM with `AWREADY <= (!BVALID) || BREADY` in WST_IDLE and `AWREADY <= 0` in WST_RESP.
+
+3. **Combinational FSM outputs (always_comb)** — drive all channel outputs (`AWREADY`, `WREADY`, `BVALID`, `ARREADY`, `RVALID`) from `always_ff`, not `always_comb`. Combinational outputs glitch and can violate AXI hold rules.
+
+4. **Register writes in WST_RESP / multi-cycle write firing** — apply all writes (CTRL, DATA_IN, pipeline start/clear) exactly once, on the cycle `(w_state == WST_AW && WVALID && WREADY)` is true. Never in WST_RESP.
+
+5. **RDATA decoded from `ARADDR` instead of `r_addr_latch`** — use `r_addr_latch` with `assign RDATA = RVALID ? rdata_mux : 0`. The latch is valid on the same cycle RVALID goes high.
+
+6. **Pipeline counter checked at `== 0` instead of `== 1`** — gives 33 cycles. Check `== 1`.
+
+7. **Write and pipeline blocks not mutually exclusive** — use `if...else if` so a pipeline start and a pipeline tick don't happen in the same cycle.
+
+8. **33-bit addition intermediate** — use `wire [31:0]` for the result; the add wraps automatically.
+
+9. **pipe_stall missing `(BVALID & ~BREADY)` term** — counter runs during write-backpressure, DATA_OUT appears one or more cycles too early.
+
+10. **Masked CTRL (WSTRB[0]=0) must not start or clear** — always guard under `if (WSTRB[0])`.
+
+11. **Reset does not clear pipe_busy / data_out_reg / status_reg** — post-reset reads of DATA_OUT and STATUS must return 0.
 
 <HINTS>
-Derived from common agent/debug traces (Icarus + decoupled AXI + cocotb-style checks).
-
- - **Icarus / Verilog TB:** ` @(posedge clk iff …) ` is **not** reliable in Icarus—use `wait(AWVALID & AWREADY)` / `wait(WVALID & WREADY)` / `wait(ARVALID & ARREADY)`, then **one** `@(posedge ACLK)` before deasserting `*VALID`. Wait on **both sides** of the handshake (`VALID & READY`), not `READY` alone, or the task can unblock before your beat started.
-
- - **Write FSM / `BVALID` oscillation:** If the master keeps `AWVALID`/`WVALID` high after the first beat, returning to `W_IDLE` while **clearing `BVALID` too early** or toggling state every cycle causes **IDLE↔RESP thrash** (`AWREADY`/`WREADY` flicker, no clean `B`). Keep **`BVALID` asserted and stable** until `BREADY` completes the response; only then drop `BVALID` and re-arm `AW`/`W` accepts. **`AWREADY` must stay 0** while any write response is outstanding.
-
- - **Register writes vs. `W_RESP`:** Applying CTRL/DATA_IN merges on **every** clock while `write_state==W_RESP` can re-fire pipeline/CTRL logic. Commit register updates **once per completed write** (e.g. a single cycle or tied to the same event that arms `B`, not an ungated multi-cycle `if` in RESP).
-
- - **Reads / `ARREADY` after `R`:** After `RVALID && RREADY`, `RVALID` should **clear**; hidden tests check that. If your **self-TB** asserts a **second** `ARVALID` while still expecting an “idle” `ARREADY==1`, the slave may **immediately accept** the next `AR` and drive `ARREADY` low again—that is **legal AXI**. Deassert `ARVALID` between reads when checking post-handshake `ARREADY`. Prefer **registered** `ARREADY` recovery (high on the `posedge` **after** `R` completes) for chunk-read torture.
-
- - **Pipeline / CTRL:** Count **32** steps only when **not** stalled: `(RVALID & ~RREADY) | (BVALID & ~BREADY)`. **Start:** CTRL byte0 strobed, `WDATA[0]` **0→1**, latch operand from **merged** `DATA_IN`. **Supersede while busy:** if byte0=1 is written again while **`ctrl` already 1** and the pipeline is **still running**, **reload** operand from current `DATA_IN` and **restart** the 32-count (do not keep the first operand).
-
- - **Golden `DATA_OUT` check:** The add is **32-bit unsigned wrap** before `>> 2`. In Python: `tmp = ((op ^ 0xA5A5A5A5) + op) & 0xFFFFFFFF; out = tmp >> 2`. A wrong hand sum often differs in the **middle nibbles** (e.g. `0x32711295` vs correct `0x32719295` for `op=0x12345678`).
-
- - **Baseline vs. grading:** An **empty `tests/`** tree on the baseline branch is normal; **cocotb** tests arrive via the **test patch** in grading—`pytest …test_axi_lite_slave_hidden…` may **not** exist until then.
-
+- Implement writes with a 3-state FSM: capture AW in WST_IDLE→WST_AW, accept W in WST_AW→WST_RESP, hold BVALID until BREADY in WST_RESP. All outputs are registered. Gate AWREADY on pending B.
+- For reads, keep RVALID/RDATA/RRESP stable while RREADY is low; do not accept a new AR until the current read response completes.
+- On writes, merge WDATA per WSTRB for CTRL and DATA_IN; unstrobed bytes keep prior register values.
+- CTRL byte0: each accepted write that strobes byte0 with WDATA[0]=1 starts the pipeline (re-latching DATA_IN into the operand and reloading the 32-cycle timer); strobing byte0 with WDATA[0]=0 clears busy/timer.
+- While BVALID is high and BREADY is low, AWREADY must be low. While RVALID is high and RREADY is low, ARREADY must be low.
+- ARESETn must clear user-visible state and cancel any in-progress pipeline.
+- Use `localparam [31:0] PIPE_CYCLES = 32;` and load `pipe_ctr <= PIPE_CYCLES` on start; complete when `pipe_ctr == 32'd1`.
+- Declare the arithmetic result as `wire [31:0] result = (((operand ^ 32'hA5A5A5A5) + operand)) >> 2;`.
+- The write-datapath block and the pipeline-decrement block must be mutually exclusive using `if...else if`.
+- RDATA: use `assign RDATA = RVALID ? rdata_mux : 32'd0;` where `rdata_mux` is a combinational mux on `r_addr_latch[5:0]`. This is correct because `r_addr_latch` and `RVALID` are latched together on the same clock edge.
 </HINTS>
