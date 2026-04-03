@@ -3,7 +3,7 @@ import os
 from pathlib import Path
 import cocotb
 from cocotb.clock import Clock
-from cocotb.triggers import RisingEdge
+from cocotb.triggers import ReadOnly, RisingEdge
 
 
 def _resolved_rtl_sv(proj_path: Path) -> Path:
@@ -37,6 +37,39 @@ async def axi_write(dut, addr, data, wstrb=0xF):
             break
     dut.WVALID.value = 0
     await RisingEdge(dut.ACLK)
+    for _ in range(50):
+        await RisingEdge(dut.ACLK)
+        if dut.BVALID.value == 1:
+            break
+    dut.BREADY.value = 0
+    await RisingEdge(dut.ACLK)
+
+
+async def axi_write_pending_b(dut, addr, data, wstrb=0xF):
+    """AW+W only; returns after W handshake so the write-response phase can be delayed (pipeline timing tests)."""
+    dut.AWADDR.value = addr
+    dut.AWVALID.value = 1
+    dut.WVALID.value = 0
+    dut.BREADY.value = 1
+    for _ in range(50):
+        await RisingEdge(dut.ACLK)
+        if dut.AWREADY.value == 1:
+            break
+    dut.AWVALID.value = 0
+    await RisingEdge(dut.ACLK)
+    dut.WDATA.value = data
+    dut.WSTRB.value = wstrb
+    dut.WVALID.value = 1
+    for _ in range(50):
+        await RisingEdge(dut.ACLK)
+        if dut.WREADY.value == 1:
+            break
+    dut.WVALID.value = 0
+    await RisingEdge(dut.ACLK)
+
+
+async def axi_drain_b(dut):
+    """Finish B handshake after axi_write_pending_b."""
     for _ in range(50):
         await RisingEdge(dut.ACLK)
         if dut.BVALID.value == 1:
@@ -142,6 +175,13 @@ async def _wait_after_ctrl_pulse(dut) -> None:
     await _wait_cycles(dut, PIPE_CYC + 12)
 
 
+async def _peek_data_out_reg(dut) -> int:
+    """Sample DATA_OUT register without an AXI read (no AR/R bus cycles during pipeline wait)."""
+    await RisingEdge(dut.ACLK)
+    await ReadOnly()
+    return int(dut.data_out_reg.value)
+
+
 @cocotb.test()
 async def test_axi_lite_write_read(dut):
     clock = Clock(dut.ACLK, 10, units="ns")
@@ -216,7 +256,8 @@ async def test_axi_lite_partial_wstrb_data_in(dut):
     clock.start(start_high=False)
     await reset_dut(dut)
     await axi_write(dut, 0x04, 0x11223344, 0xF)
-    await axi_write(dut, 0x04, 0x0000AA00, 0x04)
+    # 0x0000AA00 has AA in [15:8]; merge byte1 via WSTRB[1] (0x2), not WSTRB[2] (0x4).
+    await axi_write(dut, 0x04, 0x0000AA00, 0x02)
     await axi_write(dut, 0x00, 1)
     await _wait_after_ctrl_pulse(dut)
     merged = 0x1122AA44
@@ -313,6 +354,7 @@ async def test_axi_lite_rvalid_holds_when_rready_low(dut):
 
     dut.RREADY.value = 1
     await RisingEdge(dut.ACLK)
+    await ReadOnly()
     assert dut.RVALID.value == 0, "RVALID should clear after RREADY handshake"
 
 
@@ -491,10 +533,11 @@ async def test_axi_lite_data_out_not_ready_before_pipeline(dut):
     clock.start(start_high=False)
     await reset_dut(dut)
     await axi_write(dut, 0x04, 0xAB)
-    await axi_write(dut, 0x00, 1)
+    await axi_write_pending_b(dut, 0x00, 1)
     await _wait_cycles(dut, max(3, PIPE_CYC // 4))
-    early = await axi_read(dut, 0x08)
+    early = await _peek_data_out_reg(dut)
     assert early == 0, f"DATA_OUT should still be 0 mid-pipeline, got {early}"
+    await axi_drain_b(dut)
     await _wait_after_ctrl_pulse(dut)
     late = await axi_read(dut, 0x08)
     assert late == compute_expected(0xAB), f"DATA_OUT late read wrong: {late}"
@@ -527,12 +570,16 @@ async def test_axi_lite_data_out_holds_first_result_mid_second_pipeline(dut):
     exp1 = compute_expected(7)
     d1 = await axi_read(dut, 0x08)
     assert d1 == exp1
+    # Second CTRL[0] pulse requires a low phase (rising-edge trigger), same as other multi-run tests.
+    await axi_write(dut, 0x00, 0, wstrb=0x1)
+    await _wait_cycles(dut, 2)
     await axi_write(dut, 0x04, 99)
-    await axi_write(dut, 0x00, 1)
-    await _wait_cycles(dut, PIPE_CYC // 2)
-    mid = await axi_read(dut, 0x08)
+    await axi_write_pending_b(dut, 0x00, 1, wstrb=0x1)
+    await _wait_cycles(dut, max(2, PIPE_CYC // 4))
+    mid = await _peek_data_out_reg(dut)
     assert mid == exp1, f"Expected first result {exp1} mid second pipeline, got {mid}"
-    await _wait_cycles(dut, (PIPE_CYC + 12) - (PIPE_CYC // 2))
+    await axi_drain_b(dut)
+    await _wait_after_ctrl_pulse(dut)
     d2 = await axi_read(dut, 0x08)
     assert d2 == compute_expected(99), f"Second result wrong: {d2}"
 
@@ -579,14 +626,16 @@ async def test_axi_lite_retrigger_before_first_completion_prefers_new_operand(du
     clock.start(start_high=False)
     await reset_dut(dut)
     await axi_write(dut, 0x04, 0x15)
-    await axi_write(dut, 0x00, 1)
-    await _wait_cycles(dut, max(2, PIPE_CYC // 4))
+    await axi_write_pending_b(dut, 0x00, 1)
+    await _wait_cycles(dut, max(2, PIPE_CYC // 8))
+    # Do not drain first B yet: retrigger must happen before first pipeline completes / first B accepted.
     await axi_write(dut, 0x00, 0, wstrb=0x1)
     await axi_write(dut, 0x04, 0x2A)
-    await axi_write(dut, 0x00, 1, wstrb=0x1)
+    await axi_write_pending_b(dut, 0x00, 1, wstrb=0x1)
     await _wait_cycles(dut, max(2, PIPE_CYC // 3))
-    mid = await axi_read(dut, 0x08)
+    mid = await _peek_data_out_reg(dut)
     assert mid == 0, f"DATA_OUT should still be old value while second run in flight, got {mid}"
+    await axi_drain_b(dut)
     await _wait_after_ctrl_pulse(dut)
     out = await axi_read(dut, 0x08)
     assert out == compute_expected(0x2A), f"Retriggered run should use latest operand, got {out}"
@@ -626,7 +675,9 @@ async def test_axi_lite_bvalid_holds_until_bready(dut):
         assert dut.BRESP.value.integer == held_bresp, "BRESP changed while BVALID held"
     dut.BREADY.value = 1
     await RisingEdge(dut.ACLK)
+    await ReadOnly()
     assert dut.BVALID.value == 0, "BVALID should clear after BREADY handshake"
+    await RisingEdge(dut.ACLK)
     dut.BREADY.value = 0
 
 
@@ -662,7 +713,9 @@ async def test_axi_lite_aw_blocked_while_write_response_pending(dut):
         assert dut.AWREADY.value == 0, "AWREADY must remain low while BVALID pending"
     dut.BREADY.value = 1
     await RisingEdge(dut.ACLK)
+    await ReadOnly()
     assert dut.AWREADY.value == 1, "AWREADY should reassert after write response handshake"
+    await RisingEdge(dut.ACLK)
     dut.BREADY.value = 0
 
 
@@ -712,8 +765,10 @@ async def test_axi_lite_chunk_write_fsm_torture(dut):
 
     dut.BREADY.value = 1
     await RisingEdge(dut.ACLK)
+    await ReadOnly()
     assert dut.BVALID.value == 0, "BVALID should clear after BREADY handshake"
     assert dut.AWREADY.value == 1, "AWREADY should recover after response handshake"
+    await RisingEdge(dut.ACLK)
     dut.BREADY.value = 0
 
 
@@ -754,8 +809,12 @@ async def test_axi_lite_chunk_read_fsm_torture(dut):
 
     dut.RREADY.value = 1
     await RisingEdge(dut.ACLK)
+    await ReadOnly()
     assert dut.RVALID.value == 0, "RVALID should clear after handshake"
+    await RisingEdge(dut.ACLK)
+    await ReadOnly()
     assert dut.ARREADY.value == 1, "ARREADY should reassert after read handshake"
+    await RisingEdge(dut.ACLK)
     dut.RREADY.value = 0
 
     # Unmapped read decode must still work after hold sequence.
@@ -771,21 +830,23 @@ async def test_axi_lite_chunk_datapath_race_torture(dut):
     await reset_dut(dut)
 
     await axi_write(dut, 0x04, 0x11)
-    await axi_write(dut, 0x00, 1, wstrb=0x1)  # trigger #1
-    await _wait_cycles(dut, max(2, PIPE_CYC // 4))
+    await axi_write_pending_b(dut, 0x00, 1, wstrb=0x1)  # trigger #1
+    await _wait_cycles(dut, max(2, PIPE_CYC // 8))
 
-    early = await axi_read(dut, 0x08)
+    early = await _peek_data_out_reg(dut)
     assert early == 0, f"DATA_OUT changed too early: {early}"
+    await RisingEdge(dut.ACLK)
 
     # Retrigger before first completion with a new operand.
     await axi_write(dut, 0x00, 0, wstrb=0x1)
     await axi_write(dut, 0x04, 0x2A, wstrb=0xF)
-    await axi_write(dut, 0x00, 1, wstrb=0x1)  # trigger #2
+    await axi_write_pending_b(dut, 0x00, 1, wstrb=0x1)  # trigger #2
 
     await _wait_cycles(dut, max(2, PIPE_CYC // 3))
-    mid = await axi_read(dut, 0x08)
+    mid = await _peek_data_out_reg(dut)
     assert mid == 0, f"DATA_OUT should remain old value mid retriggered pipeline, got {mid}"
 
+    await axi_drain_b(dut)
     await _wait_after_ctrl_pulse(dut)
     out = await axi_read(dut, 0x08)
     assert out == compute_expected(0x2A), f"Latest operand should win retrigger race, got {out}"
