@@ -1,4 +1,4 @@
-Implement the complete RTL in **`sources/axi_lite_slave_dut.sv`**.
+Implement the complete RTL in **`sources/axi_lite_slave.sv`**.
 
 Implement the AXI-Lite slave module in sources/axi_lite_slave.sv from scratch.
 The module ports are already defined. You must fill in the complete RTL implementation.
