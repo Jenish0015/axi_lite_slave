@@ -29,12 +29,12 @@ module axi_lite_slave (
     input  wire                      RREADY
 );
 
-    localparam int unsigned PIPE_LEN = 32;
+    localparam integer PIPE_LEN = 32;
 
-    localparam [31:0] ADDR_CTRL = 32'h0000_0000);
-    localparam [31:0] ADDR_DIN  = 32'h0000_0004);
-    localparam [31:0] ADDR_DOUT = 32'h0000_0008);
-    localparam [31:0] ADDR_STAT = 32'h0000_000C);
+    localparam [31:0] ADDR_CTRL = 32'h0000_0000;
+    localparam [31:0] ADDR_DIN  = 32'h0000_0004;
+    localparam [31:0] ADDR_DOUT = 32'h0000_0008;
+    localparam [31:0] ADDR_STAT = 32'h0000_000C;
 
     function automatic logic mapped_addr(input [31:0] a);
         mapped_addr = (a == ADDR_CTRL) || (a == ADDR_DIN) || (a == ADDR_DOUT) || (a == ADDR_STAT);
@@ -205,8 +205,7 @@ module axi_lite_slave (
                 pipe_active   <= 1'b0;
             end else if (pipe_active) begin
                 if (pipe_cnt == 6'd31) begin
-                    data_out_reg <= (((pipe_operand ^ 32'hA5A5A5A5)) + pipe_operand) &
-                        {32{1'b1}}) >> 2;
+                    data_out_reg <= ((pipe_operand ^ 32'hA5A5A5A5) + pipe_operand) >> 2;
                     status_reg[0] <= 1'b1;
                     pipe_active   <= 1'b0;
                 end else begin
