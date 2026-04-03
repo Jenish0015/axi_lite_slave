@@ -1,6 +1,8 @@
- axi_lite_slave task prompt
- Keep in sync with `src/hud_controller/problems/basic.py` (ProblemSpec id=axi_lite_slave).
- HUD/MCP injects the same body via `spec_to_statement` plus an environment wrapper.
+# axi_lite_slave task prompt
+# Spec body: keep aligned with `src/hud_controller/problems/basic.py` (ProblemSpec id=axi_lite_slave).
+# The `<HINTS>` block below is **upstream-only** (not in basic.py); publish it for GitHub/agent use.
+# HUD/MCP uses `spec_to_statement` (no hints unless re-added to ProblemSpec).
+# Hints are curated from agent failure analysis (Icarus TB, write FSM oscillation, B/R handshake, retrigger, ARREADY sampling).
 
 Implement the complete RTL in **`sources/axi_lite_slave_dut.sv`**.
 
@@ -70,57 +72,21 @@ Hidden cocotb tests read **CTRL** after reset (expect **0**); implement read-bac
 - Do **not** update **DATA_OUT** with the final result on the same cycle as the CTRL start. Commit **DATA_OUT** (and set **STATUS** done) only after the **fixed delay** (32 non-stalled cycles) from start.
 - **STATUS[0]** should reflect **done** after that delay; clearing via CTRL (byte0 strobe with 0) should align with golden expectations.
 
----
-
-## How to run the RTL model (cocotb)
-
-- **Python** ≥ 3.11; install project deps (e.g. from repo root: `pip install -e .` or install `cocotb` and `pytest` per `pyproject.toml`).
-- **Simulator:** default **`SIM=icarus`** (Icarus Verilog, `iverilog` / `vvp` on `PATH`). Other simulators work if cocotb supports them and you set **`SIM`** accordingly.
-- **Command:** `pytest tests/test_axi_lite_slave_hidden.py::test_axi_lite_slave_hidden_runner -q`
-
-`pyproject.toml` references **`README.md`**, which may be absent in a minimal checkout; use the command above and `pyproject.toml` for dependencies.
-
----
-
-## Common pitfalls (hidden tests)
-
-- Masked **CTRL** with **`WSTRB[0]=0`** must not start or clear the pipeline.
-- Backpressure must **freeze** the pipeline counter.
-- **DATA_IN** built from multiple partial writes must match **byte-wise** merge before trigger.
-- **Reset** mid-flight must cancel pending results.
-
 <HINTS>
- - Implement AXI writes with a simple 3-state FSM: capture AW first, then accept W, then hold BVALID until BREADY.
+Derived from common agent/debug traces (Icarus + decoupled AXI + cocotb-style checks).
 
- - For reads, keep RVALID/RDATA stable while RREADY is low, and only accept a new AR when no read response is pending.
+ - **Icarus / Verilog TB:** ` @(posedge clk iff …) ` is **not** reliable in Icarus—use `wait(AWVALID & AWREADY)` / `wait(WVALID & WREADY)` / `wait(ARVALID & ARREADY)`, then **one** `@(posedge ACLK)` before deasserting `*VALID`. Wait on **both sides** of the handshake (`VALID & READY`), not `READY` alone, or the task can unblock before your beat started.
 
- - Only CTRL (0x00) and DATA_IN (0x04) are writable; writes to DATA_OUT/STATUS or unmapped addresses should return SLVERR.
+ - **Write FSM / `BVALID` oscillation:** If the master keeps `AWVALID`/`WVALID` high after the first beat, returning to `W_IDLE` while **clearing `BVALID` too early** or toggling state every cycle causes **IDLE↔RESP thrash** (`AWREADY`/`WREADY` flicker, no clean `B`). Keep **`BVALID` asserted and stable** until `BREADY` completes the response; only then drop `BVALID` and re-arm `AW`/`W` accepts. **`AWREADY` must stay 0** while any write response is outstanding.
 
- - Treat CTRL[0] as a level with edge detection: start a new run only on a 0→1 transition; while CTRL[0] stays 1, further writes of 1 must not restart. Clearing CTRL[0] (when byte0 is strobed) should clear the done flag.
+ - **Register writes vs. `W_RESP`:** Applying CTRL/DATA_IN merges on **every** clock while `write_state==W_RESP` can re-fire pipeline/CTRL logic. Commit register updates **once per completed write** (e.g. a single cycle or tied to the same event that arms `B`, not an ungated multi-cycle `if` in RESP).
 
- - When a trigger edge is recognized, latch the operand from the current DATA_IN register (after any WSTRB merge for that register)—do not sample a free-running bus—and delay committing DATA_OUT/STATUS until the full fixed-cycle pipeline finishes.
+ - **Reads / `ARREADY` after `R`:** After `RVALID && RREADY`, `RVALID` should **clear**; hidden tests check that. If your **self-TB** asserts a **second** `ARVALID` while still expecting an “idle” `ARREADY==1`, the slave may **immediately accept** the next `AR` and drive `ARREADY` low again—that is **legal AXI**. Deassert `ARVALID` between reads when checking post-handshake `ARREADY`. Prefer **registered** `ARREADY` recovery (high on the `posedge` **after** `R` completes) for chunk-read torture.
 
- - On writes, merge WDATA into each target register only on bytes where WSTRB is 1; other byte lanes of that register retain their previous values (for both CTRL and DATA_IN).
+ - **Pipeline / CTRL:** Count **32** steps only when **not** stalled: `(RVALID & ~RREADY) | (BVALID & ~BREADY)`. **Start:** CTRL byte0 strobed, `WDATA[0]` **0→1**, latch operand from **merged** `DATA_IN`. **Supersede while busy:** if byte0=1 is written again while **`ctrl` already 1** and the pipeline is **still running**, **reload** operand from current `DATA_IN` and **restart** the 32-count (do not keep the first operand).
 
- - Asserting ARESETn low should clear user-visible registers and cancel any in-progress pipeline so DATA_OUT/STATUS do not reflect a pre-reset run after release.
+ - **Golden `DATA_OUT` check:** The add is **32-bit unsigned wrap** before `>> 2`. In Python: `tmp = ((op ^ 0xA5A5A5A5) + op) & 0xFFFFFFFF; out = tmp >> 2`. A wrong hand sum often differs in the **middle nibbles** (e.g. `0x32711295` vs correct `0x32719295` for `op=0x12345678`).
 
- - While a write response (BVALID) is pending, keep AWREADY low until B completes; while a read response (RVALID) is pending, keep ARREADY low until R completes.
-
- - AW and W are independent: the master may assert W before AW or AW before W. Buffer both the latched address and the latched WDATA/WSTRB, and only emit B after both handshakes for that transaction—do not assume AW always arrives first.
-
- - If a new CTRL start (0→1 on byte0) occurs while an earlier run is still in progress, the spec expects the new run to take over: refresh the latched operand and restart the fixed-cycle countdown so the final DATA_OUT reflects the latest operand, rather than ignoring the trigger because the pipeline is already busy.
-
- - Read channel is usually modeled with **registered** outputs: after `RVALID && RREADY` completes, `RVALID` drops and **`ARREADY` returns to 1 on the next `posedge`**, not as a combinational fix-up in the same cycle. Hidden checks sample `ARREADY` on that following edge (see golden-style read FSM).
-
- - If you write an **Icarus** testbench: after `ARVALID && ARREADY` (or AW/W handshakes), wait **at least one `posedge` before** deasserting `ARVALID`/`AWVALID`/`WVALID`; dropping VALID in the same simulation time step as the handshake often makes `RVALID`/`BVALID` never appear in the sampled schedule.
-
- - Golden `DATA_OUT` matches **32-bit wrapping** add before `>> 2`: `tmp = (operand ^ 32'hA5A5A5A5) + operand` with unsigned overflow, then `tmp >> 2`. Cross-check expected values in Python with `(tmp & 0xFFFFFFFF) >> 2`—hand-calculated sums that omit wrap will disagree with cocotb.
-
- - **Supersede while busy:** a CTRL write with `WSTRB[0]=1` and `WDATA[0]=1` while **`ctrl_reg[0]` is already 1 and the pipeline is still active** should **reload** the operand from the current `data_in_reg` and **reset** the delay counter (latest operand wins). That is separate from the rule that writes of 1 while CTRL stays high **without** a new busy-phase trigger must not start an extra run after the previous one has **finished**.
+ - **Baseline vs. grading:** An **empty `tests/`** tree on the baseline branch is normal; **cocotb** tests arrive via the **test patch** in grading—`pytest …test_axi_lite_slave_hidden…` may **not** exist until then.
 
 </HINTS>
-
-
-
-
-
