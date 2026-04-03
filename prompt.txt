@@ -1,3 +1,9 @@
+ axi_lite_slave task prompt
+ Keep in sync with `src/hud_controller/problems/basic.py` (ProblemSpec id=axi_lite_slave).
+ HUD/MCP injects the same body via `spec_to_statement` plus an environment wrapper.
+
+Implement the complete RTL in **`sources/axi_lite_slave_dut.sv`**.
+
 Implement the AXI4-Lite slave as **`module axi_lite_slave`**. That file is what the automated cocotb build uses (`hdl_toplevel="axi_lite_slave"`).
 
 **Note:** `sources/axi_lite_slave.sv` in this repository is a **separate SystemVerilog testbench** (`axi_lite_slave_tb`) for local bring-up; it is **not** the DUT file the pytest/cocotb runner compiles. Do not assume the DUT ports live there.
@@ -41,7 +47,7 @@ Hidden cocotb tests read **CTRL** after reset (expect **0**); implement read-bac
 
 ## AXI4-Lite (strict)
 
-1. **AW** and **W** decoupled** (either order).
+1. **AW** and **W** decoupled (either order).
 2. **BVALID** only after **both** AW and W handshakes for that transaction.
 3. **RVALID** after AR handshake; **RDATA/RRESP** stable until **RREADY** completes.
 4. **RREADY=0**: hold **RVALID** and data/resp for multiple cycles.
@@ -84,17 +90,32 @@ Hidden cocotb tests read **CTRL** after reset (expect **0**); implement read-bac
 - **Reset** mid-flight must cancel pending results.
 
 <HINTS>
-- Implement writes with a 3-state FSM: capture AW, accept W, hold BVALID until BREADY; gate AWREADY while B is pending.
-- For reads, keep RVALID/RDATA/RRESP stable while RREADY is low; do not accept a new AR until the current read response completes.
-- On writes, merge WDATA per WSTRB for **CTRL** and **DATA_IN**; unstrobed bytes keep prior register values.
-- **CTRL byte0:** each accepted write that strobes byte0 with `WDATA[0]=1` **starts** the pipeline (re-latching **DATA_IN** into the operand and reloading the 32-cycle timer per golden behavior); strobing byte0 with `WDATA[0]=0` **clears** busy/timer as in the reference.
-- While **BVALID** is high and **BREADY** is low, keep **AWREADY** low; while **RVALID** is high and **RREADY** is low, keep **ARREADY** low.
-- **AW** and **W** are independent: buffer latched address and (WDATA, WSTRB) until both handshakes complete, then emit **B**.
-- **ARESETn** must clear user-visible state and cancel any in-progress pipeline.
+ - Implement AXI writes with a simple 3-state FSM: capture AW first, then accept W, then hold BVALID until BREADY.
+
+ - For reads, keep RVALID/RDATA stable while RREADY is low, and only accept a new AR when no read response is pending.
+
+ - Only CTRL (0x00) and DATA_IN (0x04) are writable; writes to DATA_OUT/STATUS or unmapped addresses should return SLVERR.
+
+ - Treat CTRL[0] as a level with edge detection: start a new run only on a 0→1 transition; while CTRL[0] stays 1, further writes of 1 must not restart. Clearing CTRL[0] (when byte0 is strobed) should clear the done flag.
+
+ - When a trigger edge is recognized, latch the operand from the current DATA_IN register (after any WSTRB merge for that register)—do not sample a free-running bus—and delay committing DATA_OUT/STATUS until the full fixed-cycle pipeline finishes.
+
+ - On writes, merge WDATA into each target register only on bytes where WSTRB is 1; other byte lanes of that register retain their previous values (for both CTRL and DATA_IN).
+
+ - Asserting ARESETn low should clear user-visible registers and cancel any in-progress pipeline so DATA_OUT/STATUS do not reflect a pre-reset run after release.
+
+ - While a write response (BVALID) is pending, keep AWREADY low until B completes; while a read response (RVALID) is pending, keep ARREADY low until R completes.
+
+ - AW and W are independent: the master may assert W before AW or AW before W. Buffer both the latched address and the latched WDATA/WSTRB, and only emit B after both handshakes for that transaction—do not assume AW always arrives first.
+
+ - If a new CTRL start (0→1 on byte0) occurs while an earlier run is still in progress, the spec expects the new run to take over: refresh the latched operand and restart the fixed-cycle countdown so the final DATA_OUT reflects the latest operand, rather than ignoring the trigger because the pipeline is already busy.
+
+ - Read channel is usually modeled with **registered** outputs: after `RVALID && RREADY` completes, `RVALID` drops and **`ARREADY` returns to 1 on the next `posedge`**, not as a combinational fix-up in the same cycle. Hidden checks sample `ARREADY` on that following edge (see golden-style read FSM).
+
+ - If you write an **Icarus** testbench: after `ARVALID && ARREADY` (or AW/W handshakes), wait **at least one `posedge` before** deasserting `ARVALID`/`AWVALID`/`WVALID`; dropping VALID in the same simulation time step as the handshake often makes `RVALID`/`BVALID` never appear in the sampled schedule.
+
+ - Golden `DATA_OUT` matches **32-bit wrapping** add before `>> 2`: `tmp = (operand ^ 32'hA5A5A5A5) + operand` with unsigned overflow, then `tmp >> 2`. Cross-check expected values in Python with `(tmp & 0xFFFFFFFF) >> 2`—hand-calculated sums that omit wrap will disagree with cocotb.
+
+ - **Supersede while busy:** a CTRL write with `WSTRB[0]=1` and `WDATA[0]=1` while **`ctrl_reg[0]` is already 1 and the pipeline is still active** should **reload** the operand from the current `data_in_reg` and **reset** the delay counter (latest operand wins). That is separate from the rule that writes of 1 while CTRL stays high **without** a new busy-phase trigger must not start an extra run after the previous one has **finished**.
+
 </HINTS>
-
-
-
-
-
-
