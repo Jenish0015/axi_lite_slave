@@ -1,18 +1,15 @@
-Implement an AXI4-Lite slave that wraps a **fixed-latency arithmetic pipeline** (not a FIFO). The top-level module name must be `axi_lite_slave`, and its ports must match `sources/axi_lite_slave_dut.sv` (same interface as in that file: 6-bit `AWADDR`/`ARADDR`, full AXI4-Lite handshakes).
+Implement the complete RTL in **`sources/axi_lite_slave_dut.sv`**.
 
-Put your synthesizable RTL in **`sources/axi_lite_slave_dut.sv`** (that is the file the automated tests build as the DUT).
+Implement the AXI-Lite slave module in sources/axi_lite_slave.sv from scratch.
+The module ports are already defined. You must fill in the complete RTL implementation.
 
----
-
-## Register map (byte address; use `addr[5:0]`)
-
-| Offset | Name      | Access | Behavior |
-|--------|-----------|--------|----------|
-| `0x00` | CTRL      | Write  | Per-byte **WSTRB** updates. **Byte 0** is special: if `WSTRB[0]` is 1, `WDATA[0]==1` **starts** the pipeline using the current **DATA_IN** register as the operand; if `WDATA[0]==0`, **clears** the running pipeline (idle). If `WSTRB[0]` is **0**, the CTRL write must **not** trigger or clear the pipeline (masked write is a no-op for control). |
-| `0x04` | DATA_IN   | Write  | Per-byte **WSTRB** merge: only strobed bytes update; other bytes keep their previous value. |
-| `0x08` | DATA_OUT  | Read   | While a run is **in progress** (`pipe_busy`), reads must return **0**. After completion, returns the pipeline result (see formula below). OKAY response unless you extend the design with SLVERR rules. |
-| `0x0C` | STATUS    | Read   | **0** while busy or idle after clear; when the pipeline **completes** a run, **bit 0** must be **1** (tests poll this). |
-
+## Register Map
+| Address | Name     | Access | Description            |
+|---------|----------|--------|------------------------|
+| 0x00    | ctrl_reg | R/W    | bit[0] = start trigger |
+| 0x04    | data_in  | R/W    | input data register    |
+| 0x08    | data_out | RO     | computed result        |
+| 0x0C    | status   | RO     | bit[0] = done flag     |
 Reads to CTRL/DATA_IN are not required by the hidden suite; you may return 0 or a read-back of latched registers—be consistent with your write behavior.
 
 ---
@@ -57,4 +54,42 @@ Reads to CTRL/DATA_IN are not required by the hidden suite; you may return 0 or 
 - **Backpressure** on R or B must **freeze** the pipeline counter (not “lose” cycles).
 - **Merged DATA_IN** via partial **WSTRB** must match **byte-wise** updates before the trigger used in the final check.
 
-Implement the complete RTL in **`sources/axi_lite_slave_dut.sv`**.
+
+## AXI-Lite Write FSM (3 states: W_IDLE, W_DATA, W_RESP)
+- W_IDLE: assert AWREADY=1, wait for AWVALID, latch address, go to W_DATA
+- W_DATA: assert WREADY=1, wait for WVALID, write data to register, assert BVALID=1, go to W_RESP
+- W_RESP: wait for BREADY=1, deassert BVALID, return to W_IDLE
+
+## AXI-Lite Read FSM
+- When ARVALID=1 and RVALID=0: latch address, assert ARREADY=1 and RVALID=1, output RDATA from register map
+- When RREADY=1: deassert RVALID and ARREADY
+
+## Datapath
+- When ctrl_reg[0]=1: compute and store:
+  data_out_reg = (((data_in_reg ^ 32'hA5A5A5A5) + data_in_reg) & 32'hFFFFFFFF) >> 2
+- Set status_reg[0]=1 after computation
+- Clear status_reg[0]=0 when ctrl_reg[0] is written to 0
+
+## Reset (ARESETn=0 active low)
+- All internal registers reset to 0
+- All AXI outputs reset to 0
+- FSM returns to W_IDLE
+
+<HINTS>
+- Implement AXI writes with a simple 3-state FSM: capture AW first, then accept W, then hold BVALID until BREADY.
+- For reads, keep RVALID/RDATA stable while RREADY is low, and only accept a new AR when no read response is pending.
+- Only CTRL (0x00) and DATA_IN (0x04) are writable; writes to DATA_OUT/STATUS or unmapped addresses should return SLVERR.
+- Treat CTRL[0] as a level with edge detection: start a new run only on a 0→1 transition; while CTRL[0] stays 1, further writes of 1 must not restart. Clearing CTRL[0] (when byte0 is strobed) should clear the done flag.
+- When a trigger edge is recognized, latch the operand from the current DATA_IN register (after any WSTRB merge for that register)—do not sample a free-running bus—and delay committing DATA_OUT/STATUS until the full fixed-cycle pipeline finishes.
+- On writes, merge WDATA into each target register only on bytes where WSTRB is 1; other byte lanes of that register retain their previous values (for both CTRL and DATA_IN).
+- Asserting ARESETn low should clear user-visible registers and cancel any in-progress pipeline so DATA_OUT/STATUS do not reflect a pre-reset run after release.
+- While a write response (BVALID) is pending, keep AWREADY low until B completes; while a read response (RVALID) is pending, keep ARREADY low until R completes.
+- AW and W are independent: the master may assert W before AW or AW before W. Buffer both the latched address and the latched WDATA/WSTRB, and only emit B after both handshakes for that transaction—do not assume AW always arrives first.
+- If a new CTRL start (0→1 on byte0) occurs while an earlier run is still in progress, the spec expects the new run to take over: refresh the latched operand and restart the fixed-cycle countdown so the final DATA_OUT reflects the latest operand, rather than ignoring the trigger because the pipeline is already busy.
+</HINTS>
+
+
+
+
+
+
