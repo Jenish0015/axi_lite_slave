@@ -13,6 +13,14 @@
 //   WSTRB[0]=1 and WDATA[0]=1 starts from current DATA_IN; =0 clears.
 // - DATA_IN: merge writes per WSTRB byte; AXI AW and W channels are independent.
 // ----------------------------------------------------------------------------
+// Execution (run from repository root; needs iverilog on PATH for SIM=icarus)
+//   uv sync
+//   uv run pytest tests/test_axi_lite_slave_hidden.py::test_axi_lite_slave_hidden_runner -q
+//   SIM=verilator uv run pytest tests/test_axi_lite_slave_hidden.py::test_axi_lite_slave_hidden_runner -q
+// Easiest passes to aim for first: default BRESP/RRESP=2'b00 (OKAY) on mapped regs;
+// return SLVERR (2'b10) on unmapped addresses; keep ARREADY low while RVALID && !RREADY
+// handshake completes; keep AWREADY low while BVALID && !BREADY (pending write resp).
+// ----------------------------------------------------------------------------
 
 // Baseline branch: parameterized ports, empty body (agent implements all logic).
 module axi_lite_slave #(
@@ -48,5 +56,6 @@ module axi_lite_slave #(
     // --- Empty shell: add your RTL below (see header comments). No behavior required for baseline compile. ---
     // Suggested order: (1) AXI write FSM (AW/W then B), (2) AXI read FSM (AR then R),
     // (3) register file + WSTRB merges, (4) fixed-cycle pipeline with pipe_stall holdoff.
+    // Testbench note (Python): cocotb 2.x uses Clock(signal, period, unit="ns").
 
 endmodule
