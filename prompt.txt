@@ -195,4 +195,3 @@ end
 - The write-datapath block and the pipeline-decrement block must be mutually exclusive using `if...else if`.
 - RDATA: use `assign RDATA = RVALID ? rdata_mux : 32'd0;` where `rdata_mux` is a combinational mux on `r_addr_latch[5:0]`. This is correct because `r_addr_latch` and `RVALID` are latched together on the same clock edge.
 </HINTS>
-
