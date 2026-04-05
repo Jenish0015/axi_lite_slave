@@ -45,6 +45,8 @@ module axi_lite_slave #(
     input  wire                      RREADY
 );
 
-    // Empty body — fill in sources/axi_lite_slave.sv per the problem specification.
+    // --- Empty shell: add your RTL below (see header comments). No behavior required for baseline compile. ---
+    // Suggested order: (1) AXI write FSM (AW/W then B), (2) AXI read FSM (AR then R),
+    // (3) register file + WSTRB merges, (4) fixed-cycle pipeline with pipe_stall holdoff.
 
 endmodule
