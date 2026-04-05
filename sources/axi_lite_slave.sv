@@ -1,5 +1,19 @@
 `timescale 1ns / 1ps
 
+// ----------------------------------------------------------------------------
+// Agent hints (read before implementing)
+// - Hidden tests / cocotb compile `sources/axi_lite_slave_dut.sv` when present;
+//   otherwise they compile this file. Prefer a flat `module axi_lite_slave`
+//   with NO parameters in `axi_lite_slave_dut.sv` (match ports below, 32-bit buses).
+// - Register decode uses addr[5:0]: 0x00 CTRL, 0x04 DATA_IN, 0x08 DATA_OUT, 0x0C STATUS.
+// - Fixed-latency datapath (~32 enabled cycles from start to done); while busy,
+//   reads of DATA_OUT must return 0. Do not advance the pipeline counter when
+//   stalled: (RVALID & ~RREADY) | (BVALID & ~BREADY).
+// - CTRL byte0: WSTRB[0]=0 must NOT start/clear the pipeline (masked write).
+//   WSTRB[0]=1 and WDATA[0]=1 starts from current DATA_IN; =0 clears.
+// - DATA_IN: merge writes per WSTRB byte; AXI AW and W channels are independent.
+// ----------------------------------------------------------------------------
+
 // Baseline branch: parameterized ports, empty body (agent implements all logic).
 module axi_lite_slave #(
     parameter int unsigned DATA_WIDTH = 32,
